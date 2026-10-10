@@ -4163,6 +4163,7 @@ name = "zg"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",
