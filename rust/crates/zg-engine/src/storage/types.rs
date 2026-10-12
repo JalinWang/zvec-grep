@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::domain::{
-    ContentKind, Entity, EntityFragment, EntityId, FileId, FileRecord, FragmentId, IndexTable,
+    ContentIndex, ContentKind, Entity, EntityFragment, EntityId, FileId, FileRecord, FragmentId,
     SourcePath, SymbolType,
 };
 
@@ -17,7 +17,7 @@ pub(crate) enum WorkspaceIndexStorageOptions {
     },
     ReadWrite {
         storage_path: PathBuf,
-        tables: Vec<IndexTable>,
+        tables: Vec<ContentIndex>,
     },
 }
 

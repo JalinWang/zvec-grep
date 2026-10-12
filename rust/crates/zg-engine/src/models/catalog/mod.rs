@@ -1,11 +1,12 @@
 //! Supported embedding model definitions and reference resolution.
 
-mod contract;
+mod encoding;
 mod entries;
+mod metadata;
 mod resolution;
 mod types;
 
-pub(crate) use contract::{
+pub(crate) use encoding::{
     GEMMA_CODE_QUERY_PREFIX, GEMMA_DOCUMENT_PREFIX, GEMMA_QUERY_PREFIX, QWEN3_QUERY_PREFIX,
 };
 pub(crate) use entries::get_embedding_model_catalog_entry;

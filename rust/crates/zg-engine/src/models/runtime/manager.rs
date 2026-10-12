@@ -17,14 +17,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::compute::ModelComputeRuntime;
 use crate::domain::{
-    Content,
+    Content, ContentKind,
     model::{Device, EmbeddingModelInfo, EmbeddingResult, ModelConfig},
 };
 use crate::models::{
     backends::create_embedding_model,
     spi::{
         EmbeddingConcurrencyDefaults, EmbeddingModel, EmbeddingOptions, EmbeddingPrepareOptions,
-        ModelError, ModelProgressReporter,
+        ModelError, ModelProgressReporter, QueryEncoding,
     },
 };
 
@@ -197,9 +197,6 @@ impl ModelRuntimeManager {
             // so this guarantees a single instance without blocking on I/O.
             let model =
                 (self.inner.factory)(&reference, options, self.inner.compute_runtime.clone())?;
-            model.info().validate().map_err(|error| {
-                ModelError::internal("Embedding model returned invalid metadata").with_cause(error)
-            })?;
             let entry = Arc::new(ModelRuntimeEntry {
                 runtime: Arc::new(ModelRuntime {
                     model,
@@ -411,6 +408,14 @@ impl ModelRuntimeLease {
 
     pub(crate) fn info(&self) -> &EmbeddingModelInfo {
         self.entry.runtime.model.info()
+    }
+
+    pub(crate) fn query_encoding(&self, input: ContentKind, target: ContentKind) -> QueryEncoding {
+        self.entry.runtime.model.query_encoding(input, target)
+    }
+
+    pub(crate) fn has_pinned_weights(&self) -> bool {
+        self.entry.runtime.model.has_pinned_weights()
     }
 
     /// Endpoint supplied when acquiring this runtime, after caller-side resolution.

@@ -29,6 +29,19 @@ fn fixtures() -> Vec<McpSearchPresentationCase> {
     .into_iter()
     .map(|mut fixture| {
         adapt_context_fixture(&mut fixture.result);
+        // Rust results include the content kind alongside each path.
+        for expected in [&mut fixture.expected_short, &mut fixture.expected_full] {
+            *expected = expected
+                .split_inclusive('\n')
+                .map(|line| {
+                    if line.starts_with('#') && line.contains(" matchedBy=") {
+                        format!("{line}type: text\n")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect();
+        }
         // Current engine replies already carry presentation order; old captured
         // Node replies delegated their final rank sorting to this formatter.
         if let Some(items) = fixture.result["items"].as_array_mut() {
@@ -135,7 +148,7 @@ fn source_range_cases() -> Vec<McpSearchPresentationCase> {
                 "2\tneedle"
             };
             let expected = format!(
-                "freshness: fresh\n#1 matchedBy=fts+vector sample.md:1-2\nmatched: 2\nsource:\n{lines}{}",
+                "freshness: fresh\n#1 matchedBy=fts+vector sample.md:1-2\ntype: text\nmatched: 2\nsource:\n{lines}{}",
                 if trailing_newline { "\n3\t" } else { "" }
             );
             cases.push(McpSearchPresentationCase {
@@ -314,8 +327,7 @@ async fn public_tool_preview_matches_node_without_changing_retrieval() {
 }
 
 #[test]
-fn image_search_results_expose_content_references_without_text_ranges_or_bytes() {
-    use zg_engine::api::content::ContentRef;
+fn image_search_results_show_metadata_without_text_ranges_or_bytes() {
     use zg_engine::api::context::{
         options::FileFormat,
         result::{ContentPreview, ContentRange},
@@ -330,24 +342,13 @@ fn image_search_results_expose_content_references_without_text_ranges_or_bytes()
         format: FileFormat::Png,
         size_bytes: 1024,
     };
-    item.content_ref = Some(ContentRef {
-        generation: "generation".into(),
-        entity_id: "image-entity".into(),
-    });
     item.range = ContentRange::File;
     item.content_range = ContentRange::File;
     let text = format_search_result(&result, SearchPreview::Full);
     assert!(text.contains("image.png"));
     assert!(!text.contains("image.png:"));
     assert!(text.contains("type: image; format: png; size: 1024 bytes"));
-    let reference = text
-        .lines()
-        .find_map(|line| line.strip_prefix("reference: "))
-        .expect("content reference");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(reference).expect("structured reference"),
-        serde_json::json!({"generation":"generation", "entityId":"image-entity"})
-    );
-    assert!(text.contains("zvec_grep_read_content"));
     assert!(!text.contains("source:"));
+    assert!(!text.contains("reference:"));
+    assert!(!text.contains("generation"));
 }

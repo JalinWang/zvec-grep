@@ -4,7 +4,6 @@ use std::{collections::HashSet, fs, path::Path};
 
 use crate::{
     EngineError,
-    api::content::ContentRef,
     api::context::{
         ContextOptions, ContextResult,
         options::{ContextRoute, ContextRouteMode, QueryImage},
@@ -17,7 +16,8 @@ use crate::{
             IndexTargetStatus, MatchedBy,
         },
     },
-    domain::{Content, ContentKind, FileRecord, ImageContent, Range, Workspace},
+    domain::{Content, ContentKind, EntityId, FileRecord, ImageContent, Range, Workspace},
+    models::QueryEncoding,
     utils::sha256_hex,
 };
 
@@ -169,7 +169,6 @@ pub(crate) async fn context_from_index(
     root: &Path,
     workspace: &Workspace,
     workspace_home: &Path,
-    generation: &str,
     storage: &dyn SearchStorage,
     embedding_models: &[&dyn SearchEmbeddingRuntime],
     options: &ContextOptions,
@@ -185,18 +184,24 @@ pub(crate) async fn context_from_index(
         .collect::<Vec<_>>();
     let mut targets_diagnostics = Vec::new();
     let mut bundles = Vec::new();
-    let mut result = build_context_result(
-        root,
-        workspace,
-        workspace_home,
-        generation,
-        request,
-        &groups,
-        Vec::new(),
-    )?;
+    let mut result = ContextResult {
+        freshness: None,
+        background_refresh: None,
+        query: request.display_query.clone(),
+        root: root.to_path_buf(),
+        source: ContextSource::Index,
+        coverage: ContextCoverage::RankedSample,
+        workspace_index: Some(ContextWorkspaceIndex {
+            name: workspace.name.clone(),
+            path: workspace_home.to_path_buf(),
+        }),
+        items: Vec::new(),
+        group_results: Vec::new(),
+        diagnostics: build_table_result(&workspace.root, request, &groups, Vec::new())?.diagnostics,
+    };
     let mut first_error = None;
     for target in targets {
-        let model_ref = target.schema.model.reference();
+        let model_ref = target.schema.model().reference();
         let mut diagnostic = IndexTargetDiagnostics {
             kind: target.kind,
             model_ref: model_ref.clone(),
@@ -239,21 +244,14 @@ pub(crate) async fn context_from_index(
         if empty {
             diagnostic.status = IndexTargetStatus::Empty;
         }
-        let table_result = build_context_result(
-            root,
-            workspace,
-            workspace_home,
-            generation,
-            request,
-            &recall.groups,
-            recall.searches,
-        )?;
+        let table_result =
+            build_table_result(&workspace.root, request, &recall.groups, recall.searches)?;
         let compatible = groups.len() == 1 && groups[0].routes.len() == 1;
         append_table_result(
             &mut result,
             &mut bundles,
             &target,
-            options.input_kind(),
+            recall.query_encoding,
             recall.scoring,
             compatible,
             table_result,
@@ -290,6 +288,7 @@ fn query_groups(
 }
 
 struct TableRecall {
+    query_encoding: Option<QueryEncoding>,
     groups: Vec<NormalizedContextGroup>,
     scoring: IndexScoring,
     searches: Vec<SearchPlanResult>,
@@ -309,10 +308,10 @@ async fn recall_table(
     let groups = target_query_groups(groups, target.kind);
     let prefer_symbol = options.prefer_symbol && target.kind == ContentKind::Code;
     let scoring = table_scoring(&groups, prefer_symbol);
-    let model_ref = target.schema.model.reference();
+    let model_ref = target.schema.model().reference();
     let runtime = cached
         .iter()
-        .find(|runtime| runtime.info().model.reference() == model_ref);
+        .find(|runtime| runtime.info().model().reference() == model_ref);
     let searches = recall_target(
         root,
         SearchPlan {
@@ -331,17 +330,34 @@ async fn recall_table(
         empty,
     )
     .await?;
+    let query_encoding = runtime
+        .filter(|runtime| runtime.has_pinned_weights())
+        .and_then(|_| searches.first())
+        .and_then(|search| search.query_encoding);
     Ok(TableRecall {
+        query_encoding,
         groups,
         scoring,
         searches,
     })
 }
 
+#[derive(Clone)]
+struct IndexedContextItem {
+    entity_id: EntityId,
+    item: ContextItem,
+}
+
+struct TableContextResult {
+    items: Vec<IndexedContextItem>,
+    diagnostics: ContextDiagnostics,
+}
+
 struct RankedResultGroup {
     schema: crate::domain::EmbeddingModelInfo,
+    query_encoding: Option<QueryEncoding>,
     group: IndexResultGroup,
-    items: Vec<ContextItem>,
+    items: Vec<IndexedContextItem>,
 }
 
 fn target_query_groups(
@@ -404,20 +420,20 @@ async fn recall_target(
 fn merge_table_items(
     bundles: &mut Vec<RankedResultGroup>,
     target: &super::service::QueryTarget<'_>,
-    input_kind: ContentKind,
+    query_encoding: Option<QueryEncoding>,
     scoring: IndexScoring,
     compatible: bool,
-    mut items: Vec<ContextItem>,
+    mut items: Vec<IndexedContextItem>,
 ) {
-    let model_ref = target.schema.model.reference();
+    let model_ref = target.schema.model().reference();
     if let Some(existing) = bundles.iter_mut().find(|existing| {
         compatible
             && existing.group.scoring == IndexScoring::Vector
-            && target.schema.can_compare_vectors(&existing.schema)
-            && target.schema.query_encoding(input_kind, target.kind)
-                == existing
-                    .schema
-                    .query_encoding(input_kind, existing.group.kinds[0])
+            && query_encoding.is_some()
+            && query_encoding == existing.query_encoding
+            && target.schema.model().reference() == existing.schema.model().reference()
+            && target.schema.dimension() == existing.schema.dimension()
+            && target.schema.metric() == existing.schema.metric()
     }) {
         existing.group.kinds.push(target.kind);
         if !existing.group.model_refs.contains(&model_ref) {
@@ -425,20 +441,17 @@ fn merge_table_items(
         }
         existing.items.append(&mut items);
         existing.items.sort_by(|a, b| {
-            b.score
+            b.item
+                .score
                 .unwrap_or(0.0)
-                .total_cmp(&a.score.unwrap_or(0.0))
-                .then_with(|| a.relative_path.cmp(&b.relative_path))
-                .then_with(|| {
-                    a.content_ref
-                        .as_ref()
-                        .map(|r| &r.entity_id)
-                        .cmp(&b.content_ref.as_ref().map(|r| &r.entity_id))
-                })
+                .total_cmp(&a.item.score.unwrap_or(0.0))
+                .then_with(|| a.item.relative_path.cmp(&b.item.relative_path))
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
         });
     } else {
         bundles.push(RankedResultGroup {
             schema: target.schema.clone(),
+            query_encoding,
             group: IndexResultGroup {
                 id: target.kind.as_str().to_owned(),
                 kinds: vec![target.kind],
@@ -456,10 +469,10 @@ fn append_table_result(
     result: &mut ContextResult,
     bundles: &mut Vec<RankedResultGroup>,
     target: &super::service::QueryTarget<'_>,
-    input_kind: ContentKind,
+    query_encoding: Option<QueryEncoding>,
     scoring: IndexScoring,
     compatible: bool,
-    table_result: ContextResult,
+    table_result: TableContextResult,
 ) {
     result
         .diagnostics
@@ -477,7 +490,7 @@ fn append_table_result(
     merge_table_items(
         bundles,
         target,
-        input_kind,
+        query_encoding,
         scoring,
         compatible && scoring == IndexScoring::Vector,
         table_result.items,
@@ -511,14 +524,14 @@ fn finish_context_result(
     for (mut bundle, allocation) in bundles.into_iter().zip(allocations) {
         bundle.items.truncate(allocation);
         for (i, item) in bundle.items.iter_mut().enumerate() {
-            item.rank = i + 1;
-            if let Some(trace) = &mut item.trace {
+            item.item.rank = i + 1;
+            if let Some(trace) = &mut item.item.trace {
                 trace.final_selection.cutoff_rank = allocation;
             }
         }
         bundle.group.item_start = items.len();
         bundle.group.item_count = bundle.items.len();
-        items.extend(bundle.items);
+        items.extend(bundle.items.into_iter().map(|candidate| candidate.item));
         result_groups.push(bundle.group);
     }
     result.diagnostics.empty_reason = if !items.is_empty() {
@@ -571,21 +584,16 @@ fn finish_context_result(
     result
 }
 
-fn build_context_result(
-    root: &Path,
-    workspace: &Workspace,
-    workspace_home: &Path,
-    generation: &str,
+fn build_table_result(
+    workspace_root: &Path,
     request: &NormalizedContextRequest,
     groups: &[NormalizedContextGroup],
     searches: Vec<SearchPlanResult>,
-) -> Result<ContextResult, EngineError> {
+) -> Result<TableContextResult, EngineError> {
     let group_items = searches
         .iter()
         .zip(groups)
-        .map(|(search, group)| {
-            search_plan_to_context_items(search, &workspace.root, generation, group)
-        })
+        .map(|(search, group)| search_plan_to_context_items(search, workspace_root, group))
         .collect::<Result<Vec<_>, _>>()?;
     let coverage_groups = groups
         .iter()
@@ -602,28 +610,8 @@ fn build_context_result(
         .collect();
     let hits_returned = items.len();
 
-    Ok(ContextResult {
-        freshness: None,
-        background_refresh: None,
-        query: request.display_query.clone(),
-        root: root.to_path_buf(),
-        source: ContextSource::Index,
-        coverage: ContextCoverage::RankedSample,
-        workspace_index: Some(ContextWorkspaceIndex {
-            name: workspace.name.as_str().to_owned(),
-            path: workspace_home.to_path_buf(),
-        }),
+    Ok(TableContextResult {
         items,
-        group_results: groups
-            .iter()
-            .zip(group_items)
-            .map(|(group, items)| ContextGroupResult {
-                id: group.id.clone(),
-                query: group.query.clone(),
-                role: group.role,
-                items,
-            })
-            .collect(),
         diagnostics: ContextDiagnostics {
             empty_reason: (hits_returned == 0).then_some(EmptyReason::NoMatches),
             index: Some(IndexDiagnostics {
@@ -665,69 +653,67 @@ fn build_context_result(
 fn search_plan_to_context_items(
     result: &SearchPlanResult,
     workspace_root: &Path,
-    generation: &str,
     group: &NormalizedContextGroup,
-) -> Result<Vec<ContextItem>, EngineError> {
+) -> Result<Vec<IndexedContextItem>, EngineError> {
     result
         .hits
         .iter()
         .map(|hit| {
             let target = context_item_target(hit)?;
-            Ok(ContextItem {
-                kind: ContextItemKind::IndexedEntity,
-                rank: hit.rank,
-                absolute_path: workspace_root.join(&hit.file.relative_path),
-                relative_path: hit.file.relative_path.to_path_buf(),
-                range: hit.entity.source_range.into(),
-                excerpt_range: target.excerpt_range,
-                content_range: target.content_range,
-                preview: target.preview,
-                content_ref: Some(ContentRef {
-                    generation: generation.to_owned(),
-                    entity_id: hit.entity.id.as_str().to_owned(),
-                }),
-                outline: None,
-                content_role: Some(target.content_role),
-                status: file_freshness_status(workspace_root, &hit.file),
-                score: Some(hit.score),
-                matched_by: hit.matched_by,
-                metadata: hit.entity.metadata.clone(),
-                container: None,
-                trace: hit.trace.clone(),
-                query_groups: vec![ContextQueryGroupMatch {
-                    id: group.id.clone(),
-                    query: group.query.clone(),
-                    role: group.role,
+            Ok(IndexedContextItem {
+                entity_id: hit.entity.id.clone(),
+                item: ContextItem {
+                    kind: ContextItemKind::IndexedEntity,
                     rank: hit.rank,
+                    absolute_path: workspace_root.join(&hit.file.relative_path),
+                    relative_path: hit.file.relative_path.to_path_buf(),
+                    range: hit.entity.source_range.into(),
+                    excerpt_range: target.excerpt_range,
+                    content_range: target.content_range,
+                    preview: target.preview,
+                    outline: None,
+                    content_role: Some(target.content_role),
+                    status: file_freshness_status(workspace_root, &hit.file),
+                    score: Some(hit.score),
                     matched_by: hit.matched_by,
-                }],
-                selection_reason: None,
-                coverage_group: None,
+                    metadata: hit.entity.metadata.clone(),
+                    container: None,
+                    trace: hit.trace.clone(),
+                    query_groups: vec![ContextQueryGroupMatch {
+                        id: group.id.clone(),
+                        query: group.query.clone(),
+                        role: group.role,
+                        rank: hit.rank,
+                        matched_by: hit.matched_by,
+                    }],
+                    selection_reason: None,
+                    coverage_group: None,
+                },
             })
         })
         .collect()
 }
 
 fn select_and_rank_context_items(
-    items: Vec<ContextItem>,
+    items: Vec<IndexedContextItem>,
     coverage_group_ids: &[String],
-) -> Vec<ContextItem> {
-    let mut deduped: Vec<ContextItem> = Vec::new();
+) -> Vec<IndexedContextItem> {
+    let mut deduped: Vec<IndexedContextItem> = Vec::new();
     for item in items {
-        let key = context_item_dedupe_key(&item);
+        let key = item.entity_id.clone();
         if let Some(existing) = deduped
             .iter_mut()
-            .find(|candidate| context_item_dedupe_key(candidate) == key)
+            .find(|candidate| candidate.entity_id == key)
         {
-            merge_query_group_matches(&mut existing.query_groups, &item.query_groups);
-            existing.matched_by = merged_matched_by(&existing.query_groups);
+            merge_query_group_matches(&mut existing.item.query_groups, &item.item.query_groups);
+            existing.item.matched_by = merged_matched_by(&existing.item.query_groups);
         } else {
             deduped.push(item);
         }
     }
     let mut globally_ranked = deduped.clone();
     globally_ranked.sort_by(compare_global_rank);
-    let mut selected = HashSet::<String>::new();
+    let mut selected = HashSet::<EntityId>::new();
     let mut prioritized = Vec::new();
 
     for group_id in coverage_group_ids {
@@ -736,15 +722,15 @@ fn select_and_rank_context_items(
         }
         let mut candidates = deduped
             .iter()
-            .filter(|item| !selected.contains(&context_item_dedupe_key(item)))
-            .filter(|item| query_group_match(item, group_id).is_some())
+            .filter(|item| !selected.contains(&item.entity_id))
+            .filter(|item| query_group_match(&item.item, group_id).is_some())
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| compare_group_rank(left, right, group_id));
         if let Some(mut candidate) = candidates.into_iter().next() {
-            selected.insert(context_item_dedupe_key(&candidate));
-            candidate.selection_reason = Some(ContextSelectionReason::Coverage);
-            candidate.coverage_group = Some(group_id.clone());
+            selected.insert(candidate.entity_id.clone());
+            candidate.item.selection_reason = Some(ContextSelectionReason::Coverage);
+            candidate.item.coverage_group = Some(group_id.clone());
             prioritized.push(candidate);
         }
     }
@@ -752,20 +738,20 @@ fn select_and_rank_context_items(
         if prioritized.len() >= DEFAULT_CONTEXT_PRIORITY_LIMIT {
             break;
         }
-        let key = context_item_dedupe_key(&candidate);
+        let key = candidate.entity_id.clone();
         if selected.insert(key) {
-            candidate.selection_reason = Some(ContextSelectionReason::GlobalFill);
-            candidate.coverage_group = None;
+            candidate.item.selection_reason = Some(ContextSelectionReason::GlobalFill);
+            candidate.item.coverage_group = None;
             prioritized.push(candidate);
         }
     }
     prioritized.extend(
         globally_ranked
             .into_iter()
-            .filter(|item| !selected.contains(&context_item_dedupe_key(item))),
+            .filter(|item| !selected.contains(&item.entity_id)),
     );
     for (index, item) in prioritized.iter_mut().enumerate() {
-        item.rank = index + 1;
+        item.item.rank = index + 1;
     }
     prioritized
 }
@@ -800,12 +786,15 @@ fn merged_matched_by(matches: &[ContextQueryGroupMatch]) -> MatchedBy {
     }
 }
 
-fn compare_global_rank(left: &ContextItem, right: &ContextItem) -> std::cmp::Ordering {
-    global_rrf_score(right)
-        .total_cmp(&global_rrf_score(left))
-        .then_with(|| best_group_rank(left).cmp(&best_group_rank(right)))
-        .then_with(|| first_group_number(left).cmp(&first_group_number(right)))
-        .then_with(|| context_item_dedupe_key(left).cmp(&context_item_dedupe_key(right)))
+fn compare_global_rank(
+    left: &IndexedContextItem,
+    right: &IndexedContextItem,
+) -> std::cmp::Ordering {
+    global_rrf_score(&right.item)
+        .total_cmp(&global_rrf_score(&left.item))
+        .then_with(|| best_group_rank(&left.item).cmp(&best_group_rank(&right.item)))
+        .then_with(|| first_group_number(&left.item).cmp(&first_group_number(&right.item)))
+        .then_with(|| left.entity_id.cmp(&right.entity_id))
 }
 
 fn global_rrf_score(item: &ContextItem) -> f64 {
@@ -816,12 +805,13 @@ fn global_rrf_score(item: &ContextItem) -> f64 {
 }
 
 fn compare_group_rank(
-    left: &ContextItem,
-    right: &ContextItem,
+    left: &IndexedContextItem,
+    right: &IndexedContextItem,
     group_id: &str,
 ) -> std::cmp::Ordering {
-    let left_rank = query_group_match(left, group_id).map_or(usize::MAX, |group| group.rank);
-    let right_rank = query_group_match(right, group_id).map_or(usize::MAX, |group| group.rank);
+    let left_rank = query_group_match(&left.item, group_id).map_or(usize::MAX, |group| group.rank);
+    let right_rank =
+        query_group_match(&right.item, group_id).map_or(usize::MAX, |group| group.rank);
     left_rank
         .cmp(&right_rank)
         .then_with(|| compare_global_rank(left, right))
@@ -854,13 +844,6 @@ fn context_group_number(id: &str) -> usize {
     id.strip_prefix('Q')
         .and_then(|value| value.parse().ok())
         .unwrap_or(usize::MAX)
-}
-
-fn context_item_dedupe_key(item: &ContextItem) -> String {
-    item.content_ref.as_ref().map_or_else(
-        || format!("range:{}:{:?}", item.absolute_path.display(), item.range),
-        |reference| format!("entity:{}:{}", reference.generation, reference.entity_id),
-    )
 }
 
 struct ContextItemTarget {
@@ -1039,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn image_results_return_metadata_and_stable_reference_without_image_payload() {
+    fn image_results_return_metadata_without_internal_identity_or_payload() {
         use crate::domain::{
             Content, ContentKind, Entity, EntityId, FileFormat, FileId, FileIndexStatus,
             FileRecord, FileSnapshot, ImageContent, Range, SourcePath,
@@ -1050,6 +1033,7 @@ mod tests {
         let file_id = FileId::new(1);
         let id = EntityId::new(file_id, &content, Range::Full).expect("id");
         let search = SearchPlanResult {
+            query_encoding: None,
             routes: vec![],
             timings: vec![],
             hits: vec![SearchHit {
@@ -1087,11 +1071,11 @@ mod tests {
         let items = super::search_plan_to_context_items(
             &search,
             std::path::Path::new("/workspace"),
-            "generation-1",
             &group,
         )
         .expect("result");
-        let item = &items[0];
+        assert_eq!(items[0].entity_id, id);
+        let item = &items[0].item;
         assert_eq!(item.preview.text(), None);
         assert_eq!(item.range, ContentRange::File);
         assert_eq!(item.preview.kind(), ContentKind::Image);
@@ -1102,20 +1086,20 @@ mod tests {
                 size_bytes: 3
             }
         );
-        let reference = item.content_ref.as_ref().expect("content reference");
-        assert_eq!(reference.entity_id, id.as_str());
-        assert_eq!(reference.generation, "generation-1");
         assert_eq!(item.absolute_path, PathBuf::from("/workspace/image.png"));
         let json = serde_json::to_value(item).expect("JSON");
         assert_eq!(
             json["preview"],
             serde_json::json!({"kind": "image", "value": {"format": "png", "size_bytes": 3}})
         );
-        assert_eq!(
-            json["content_ref"],
-            serde_json::json!({"entity_id": id.as_str(), "generation": "generation-1"})
-        );
-        for removed in ["image", "entity_id", "content_kind", "content"] {
+        for removed in [
+            "image",
+            "entity_id",
+            "content_kind",
+            "content",
+            "content_ref",
+            "generation",
+        ] {
             assert!(json.get(removed).is_none(), "obsolete field {removed}");
         }
     }
@@ -1201,13 +1185,6 @@ mod tests {
         let item = context_item_for_hit(&hit);
         assert_eq!(item.range, source_range.into());
         assert_eq!(item.preview.kind(), hit.entity.content.kind());
-        assert_eq!(
-            item.content_ref,
-            Some(crate::api::content::ContentRef {
-                generation: "test-generation".into(),
-                entity_id: hit.entity.id.as_str().into(),
-            })
-        );
         assert_eq!(item.excerpt_range, Some(fragment_source_range.into()));
         assert_eq!(item.content_range, fragment_source_range.into());
         assert_eq!(item.preview.text().expect("text preview"), "中😀\r\nβ");
@@ -1230,6 +1207,7 @@ mod tests {
 
     fn context_item_for_hit(hit: &super::SearchHit) -> ContextItem {
         let search = super::SearchPlanResult {
+            query_encoding: None,
             routes: Vec::new(),
             hits: vec![hit.clone()],
             timings: Vec::new(),
@@ -1239,14 +1217,10 @@ mod tests {
             ..ContextOptions::default()
         })
         .expect("request");
-        super::search_plan_to_context_items(
-            &search,
-            std::path::Path::new("."),
-            "test-generation",
-            &request.groups[0],
-        )
-        .expect("context items")
-        .remove(0)
+        super::search_plan_to_context_items(&search, std::path::Path::new("."), &request.groups[0])
+            .expect("context items")
+            .remove(0)
+            .item
     }
 
     #[test]
@@ -1367,6 +1341,7 @@ mod tests {
         );
         let content = Content::Text(content.to_owned());
         let search = SearchPlanResult {
+            query_encoding: None,
             routes: Vec::new(),
             hits: vec![SearchHit {
                 entity: Entity {
@@ -1395,28 +1370,33 @@ mod tests {
             name: "workspace".to_owned(),
             root: original_root.clone(),
             scan: crate::domain::ScanRules::default(),
-            index: IndexState::Enabled(Box::new(IndexDescriptor::single(EmbeddingModelInfo {
-                space: crate::domain::model::EmbeddingSpace::fixture(),
-                retrieval: crate::domain::model::EmbeddingRetrieval::TextImage,
-                model: crate::domain::model::ModelInfo::new(
-                    "local",
-                    "fixture",
-                    [
-                        crate::domain::ContentKind::Text,
-                        crate::domain::ContentKind::Code,
-                    ],
+            index: IndexState::Enabled(Box::new(
+                IndexDescriptor::new(
+                    EmbeddingModelInfo::new(
+                        crate::domain::model::ModelInfo::new(
+                            "local",
+                            "fixture",
+                            [
+                                crate::domain::ContentKind::Text,
+                                crate::domain::ContentKind::Code,
+                            ],
+                            32,
+                        )
+                        .expect("fixture model identity"),
+                        2,
+                        EmbeddingMetric::Cosine,
+                        None,
+                        None,
+                    )
+                    .expect("embedding model"),
+                    std::collections::BTreeMap::new(),
+                    crate::domain::FTS_CONFIG,
                 )
-                .expect("fixture model identity"),
-                dimension: 2,
-                metric: EmbeddingMetric::Cosine,
-                max_batch_size: 32,
-                max_input_tokens: None,
-                max_image_bytes: None,
-            }))),
+                .expect("index descriptor"),
+            )),
             created_epoch_ms: 0,
             updated_epoch_ms: 0,
         };
-        let workspace_home = directory.path().join("index");
 
         for root in [&original_root, &moved_root] {
             if root == &moved_root {
@@ -1424,21 +1404,22 @@ mod tests {
                 workspace.root = moved_root.clone();
             }
             // The request may start in a subdirectory; source paths retain the workspace base.
-            let requested_root = root.join("src");
-            let result = super::build_context_result(
-                &requested_root,
-                &workspace,
-                &workspace_home,
-                "test-generation",
+            let result = super::build_table_result(
+                &workspace.root,
                 &request,
                 &request.groups,
                 vec![search.clone()],
             )
             .expect("context result");
-            assert_eq!(result.root, requested_root);
-            assert_eq!(result.items[0].absolute_path, root.join("src/file.txt"));
-            assert_eq!(result.items[0].relative_path, PathBuf::from("src/file.txt"));
-            assert_eq!(result.items[0].status, ContextItemStatus::Fresh);
+            assert_eq!(
+                result.items[0].item.absolute_path,
+                root.join("src/file.txt")
+            );
+            assert_eq!(
+                result.items[0].item.relative_path,
+                PathBuf::from("src/file.txt")
+            );
+            assert_eq!(result.items[0].item.status, ContextItemStatus::Fresh);
         }
         assert_eq!(
             super::file_freshness_status(&original_root, &file),
@@ -1497,30 +1478,21 @@ mod tests {
         let selected = select_and_rank_context_items(items, &["Q1".to_owned(), "Q2".to_owned()]);
 
         assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].entity_id.as_str(), "shared");
+        assert_eq!(selected[0].item.query_groups.len(), 2);
+        assert_eq!(selected[0].item.matched_by, MatchedBy::FtsAndVector);
         assert_eq!(
-            selected[0]
-                .content_ref
-                .as_ref()
-                .map(|reference| reference.entity_id.as_str()),
-            Some("shared")
-        );
-        assert_eq!(selected[0].query_groups.len(), 2);
-        assert_eq!(selected[0].matched_by, MatchedBy::FtsAndVector);
-        assert_eq!(
-            selected[0].selection_reason,
+            selected[0].item.selection_reason,
             Some(ContextSelectionReason::Coverage)
         );
-        assert_eq!(selected[0].coverage_group.as_deref(), Some("Q1"));
+        assert_eq!(selected[0].item.coverage_group.as_deref(), Some("Q1"));
+        assert_eq!(selected[1].entity_id.as_str(), "q2-only");
+        assert_eq!(selected[1].item.coverage_group.as_deref(), Some("Q2"));
         assert_eq!(
-            selected[1]
-                .content_ref
-                .as_ref()
-                .map(|reference| reference.entity_id.as_str()),
-            Some("q2-only")
-        );
-        assert_eq!(selected[1].coverage_group.as_deref(), Some("Q2"));
-        assert_eq!(
-            selected.iter().map(|item| item.rank).collect::<Vec<_>>(),
+            selected
+                .iter()
+                .map(|item| item.item.rank)
+                .collect::<Vec<_>>(),
             [1, 2, 3]
         );
     }
@@ -1535,45 +1507,44 @@ mod tests {
         }
     }
 
-    fn item(id: &str, query_group: ContextQueryGroupMatch) -> ContextItem {
-        ContextItem {
-            kind: ContextItemKind::IndexedEntity,
-            rank: query_group.rank,
-            absolute_path: PathBuf::from("/workspace/source.rs"),
-            relative_path: PathBuf::from("source.rs"),
-            range: ContentRange::Text {
-                start_line: 1,
-                end_line: 1,
-                start_byte_offset: 0,
-                end_byte_offset: 1,
-                start_byte_column: 0,
-                end_byte_column: 1,
+    fn item(id: &str, query_group: ContextQueryGroupMatch) -> super::IndexedContextItem {
+        super::IndexedContextItem {
+            entity_id: crate::domain::EntityId::from_string(id.to_owned()),
+            item: ContextItem {
+                kind: ContextItemKind::IndexedEntity,
+                rank: query_group.rank,
+                absolute_path: PathBuf::from("/workspace/source.rs"),
+                relative_path: PathBuf::from("source.rs"),
+                range: ContentRange::Text {
+                    start_line: 1,
+                    end_line: 1,
+                    start_byte_offset: 0,
+                    end_byte_offset: 1,
+                    start_byte_column: 0,
+                    end_byte_column: 1,
+                },
+                content_range: ContentRange::Text {
+                    start_line: 1,
+                    end_line: 1,
+                    start_byte_offset: 0,
+                    end_byte_offset: 1,
+                    start_byte_column: 0,
+                    end_byte_column: 1,
+                },
+                excerpt_range: None,
+                preview: ContentPreview::Text(id.to_owned()),
+                outline: None,
+                content_role: Some(ContextContentRole::Source),
+                status: ContextItemStatus::Fresh,
+                score: Some(1.0),
+                matched_by: query_group.matched_by,
+                metadata: None,
+                container: None,
+                trace: None,
+                query_groups: vec![query_group],
+                selection_reason: None,
+                coverage_group: None,
             },
-            content_range: ContentRange::Text {
-                start_line: 1,
-                end_line: 1,
-                start_byte_offset: 0,
-                end_byte_offset: 1,
-                start_byte_column: 0,
-                end_byte_column: 1,
-            },
-            excerpt_range: None,
-            preview: ContentPreview::Text(id.to_owned()),
-            outline: None,
-            content_role: Some(ContextContentRole::Source),
-            status: ContextItemStatus::Fresh,
-            score: Some(1.0),
-            matched_by: query_group.matched_by,
-            metadata: None,
-            content_ref: Some(crate::api::content::ContentRef {
-                generation: "generation-1".into(),
-                entity_id: id.to_owned(),
-            }),
-            container: None,
-            trace: None,
-            query_groups: vec![query_group],
-            selection_reason: None,
-            coverage_group: None,
         }
     }
 }

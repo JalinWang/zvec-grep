@@ -1,115 +1,115 @@
 use super::ModelInfo;
-use crate::domain::ContentKind;
 use crate::{EngineError, EngineResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EmbeddingModelInfo {
-    pub model: ModelInfo,
-    pub space: EmbeddingSpace,
-    pub retrieval: EmbeddingRetrieval,
-    pub dimension: usize,
-    pub metric: EmbeddingMetric,
-    /// Maximum number of inputs accepted by one embedding request.
-    pub max_batch_size: usize,
-    /// Positive token limit when applicable and known.
-    pub max_input_tokens: Option<usize>,
-    /// Positive image size limit in bytes when applicable and known.
-    pub max_image_bytes: Option<usize>,
+    model: ModelInfo,
+    dimension: usize,
+    metric: EmbeddingMetric,
+    max_input_tokens: Option<usize>,
+    max_image_bytes: Option<usize>,
 }
 
 impl EmbeddingModelInfo {
-    pub(crate) fn query_encoding(&self, input: ContentKind, target: ContentKind) -> String {
-        let instruction = if input != ContentKind::Image && target == ContentKind::Code {
-            self.space.code_query_instruction.as_deref().unwrap_or("")
-        } else {
-            ""
-        };
-        crate::utils::sha256_hex_parts([
-            self.space.encoding_fingerprint.as_bytes(),
-            instruction.as_bytes(),
-        ])
-    }
-
-    pub(crate) fn supports_retrieval(&self, input: ContentKind, target: ContentKind) -> bool {
-        self.model.supports_content(input)
-            && self.model.supports_content(target)
-            && match self.retrieval {
-                EmbeddingRetrieval::Text => {
-                    input != ContentKind::Image && target != ContentKind::Image
-                }
-                EmbeddingRetrieval::TextImage => true,
-            }
-    }
-
-    /// Vector scores are comparable only for the same query and a pinned space.
-    pub(crate) fn can_compare_vectors(&self, other: &Self) -> bool {
-        self.space.revision.is_some() && self.ensure_index_compatible(other).is_ok()
-    }
-
-    pub(crate) fn validate(&self) -> EngineResult<()> {
+    pub(crate) fn new(
+        model: ModelInfo,
+        dimension: usize,
+        metric: EmbeddingMetric,
+        max_input_tokens: Option<usize>,
+        max_image_bytes: Option<usize>,
+    ) -> EngineResult<Self> {
         for (field, value) in [
-            ("dimension", Some(self.dimension)),
-            ("max_batch_size", Some(self.max_batch_size)),
-            ("max_input_tokens", self.max_input_tokens),
-            ("max_image_bytes", self.max_image_bytes),
+            ("dimension", Some(dimension)),
+            ("max_input_tokens", max_input_tokens),
+            ("max_image_bytes", max_image_bytes),
         ] {
             if value == Some(0) {
                 return Err(EngineError::invalid_argument(format!(
-                    "embedding model {field} must be greater than zero",
+                    "embedding model {} {field} must be greater than zero",
+                    model.reference(),
                 )));
             }
         }
-        Ok(())
+        Ok(Self {
+            model,
+            dimension,
+            metric,
+            max_input_tokens,
+            max_image_bytes,
+        })
+    }
+
+    pub(crate) fn model(&self) -> &ModelInfo {
+        &self.model
+    }
+
+    pub(crate) fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub(crate) fn metric(&self) -> EmbeddingMetric {
+        self.metric
+    }
+
+    pub(crate) fn max_input_tokens(&self) -> Option<usize> {
+        self.max_input_tokens
+    }
+
+    pub(crate) fn max_image_bytes(&self) -> Option<usize> {
+        self.max_image_bytes
     }
 
     /// Check the fields that determine whether an existing index can be reused.
     pub(crate) fn ensure_index_compatible(&self, other: &Self) -> EngineResult<()> {
-        if self.model != other.model
-            || self.space != other.space
-            || self.retrieval != other.retrieval
-            || self.dimension != other.dimension
-            || self.metric != other.metric
-            || self.max_input_tokens != other.max_input_tokens
-            || self.max_image_bytes != other.max_image_bytes
+        let reason = if self.model.provider() != other.model.provider()
+            || self.model.name() != other.model.name()
         {
-            return Err(EngineError::invalid_argument(
-                "existing index uses a different embedding model; rebuild the index",
-            ));
-        }
-        Ok(())
+            "model reference changed".to_owned()
+        } else if self.dimension != other.dimension {
+            format!(
+                "dimension changed from {} to {}",
+                self.dimension, other.dimension
+            )
+        } else if self.metric != other.metric {
+            format!(
+                "metric changed from {:?} to {:?}",
+                self.metric, other.metric
+            )
+        } else {
+            return Ok(());
+        };
+        Err(EngineError::invalid_argument(format!(
+            "embedding model {} is incompatible with index model {}: {reason}; rebuild the index",
+            other.model.reference(),
+            self.model.reference(),
+        )))
     }
 }
 
-/// Immutable weights and the adapter's complete encoding recipe.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct EmbeddingSpace {
-    /// None means the service exposes only a mutable model alias.
-    pub revision: Option<String>,
-    pub encoding_fingerprint: String,
-    /// A distinct query task for code search, when required by the adapter.
-    pub code_query_instruction: Option<String>,
-}
-
-impl EmbeddingSpace {
-    #[cfg(test)]
-    pub(crate) fn fixture() -> Self {
-        Self {
-            revision: Some("fixture-v1".to_owned()),
-            encoding_fingerprint: "fixture-v1".to_owned(),
-            code_query_instruction: None,
+impl<'de> Deserialize<'de> for EmbeddingModelInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Fields {
+            model: ModelInfo,
+            dimension: usize,
+            metric: EmbeddingMetric,
+            max_input_tokens: Option<usize>,
+            max_image_bytes: Option<usize>,
         }
-    }
-}
 
-/// Retrieval tasks verified for the catalog model and its implemented adapter.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EmbeddingRetrieval {
-    Text,
-    TextImage,
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.model,
+            fields.dimension,
+            fields.metric,
+            fields.max_input_tokens,
+            fields.max_image_bytes,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Distance or similarity measure for embedding vectors.

@@ -15,12 +15,12 @@ pub(crate) enum EmbeddingCatalogEntry {
 impl EmbeddingCatalogEntry {
     /// Describes the input contract implemented by the catalog's model adapter.
     pub(crate) fn model_info(self) -> EngineResult<ModelInfo> {
-        let (provider, name) = match self {
-            Self::EmbeddingGemma2(entry) => (entry.provider, entry.model),
-            Self::LlamaCpp(entry) => (entry.provider, entry.model),
-            Self::Qwen(entry) => (entry.provider, entry.model),
-            Self::Transformers(entry) => (entry.provider, entry.model),
-            Self::Model2Vec(entry) => (entry.provider, entry.model),
+        let (provider, name, max_batch_size) = match self {
+            Self::EmbeddingGemma2(entry) => (entry.provider, entry.model, 1),
+            Self::LlamaCpp(entry) => (entry.provider, entry.model, entry.max_batch_size),
+            Self::Qwen(entry) => (entry.provider, entry.model, entry.max_batch_size),
+            Self::Transformers(entry) => (entry.provider, entry.model, entry.max_batch_size),
+            Self::Model2Vec(entry) => (entry.provider, entry.model, entry.max_batch_size),
         };
         if matches!(self, Self::EmbeddingGemma2(_))
             || matches!(self, Self::Qwen(entry) if entry.kind == "multimodal")
@@ -29,9 +29,15 @@ impl EmbeddingCatalogEntry {
                 provider,
                 name,
                 [ContentKind::Text, ContentKind::Code, ContentKind::Image],
+                max_batch_size,
             )
         } else {
-            ModelInfo::new(provider, name, [ContentKind::Text, ContentKind::Code])
+            ModelInfo::new(
+                provider,
+                name,
+                [ContentKind::Text, ContentKind::Code],
+                max_batch_size,
+            )
         }
     }
 

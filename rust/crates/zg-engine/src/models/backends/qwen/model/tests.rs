@@ -239,9 +239,9 @@ fn fused_response() -> Value {
 #[tokio::test]
 async fn multimodal_fusion_preserves_part_order_and_returns_one_vector() {
     let (model, http) = multimodal_model(Some(fused_response()));
-    assert!(model.info().model.supports_content(ContentKind::Text));
-    assert!(model.info().model.supports_content(ContentKind::Code));
-    assert!(model.info().model.supports_content(ContentKind::Image));
+    assert!(model.info().model().supports_content(ContentKind::Text));
+    assert!(model.info().model().supports_content(ContentKind::Code));
+    assert!(model.info().model().supports_content(ContentKind::Image));
     let trace_headers = EmbeddingTraceHeaders {
         traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
         tracestate: None,

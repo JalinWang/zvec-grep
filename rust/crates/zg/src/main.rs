@@ -125,12 +125,6 @@ async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
             request,
             output,
         } => Box::pin(execute_request(mode, home.as_deref(), *request, output)).await,
-        CliPlan::ReadContent {
-            mode,
-            home,
-            request,
-            output,
-        } => execute_read_content(mode, home.as_deref(), request, &output).await,
         CliPlan::Index {
             mode,
             home,
@@ -210,47 +204,6 @@ async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
         CliPlan::Uninstall(args) => zg_cli::execute_uninstall(&args).map_err(Into::into),
         CliPlan::Help(_) | CliPlan::Version => Ok(()),
     }
-}
-
-async fn execute_read_content(
-    mode: ClientMode,
-    home: Option<&Path>,
-    request: zg_engine::api::content::ReadContentOptions,
-    output: &Path,
-) -> Result<(), Box<dyn Error>> {
-    use std::io::Write;
-    use zg_engine::api::content::Content;
-    let result = if use_server(mode, home).await? {
-        let home = zg_daemon::resolve_home(home.map(Path::to_owned))?;
-        let DaemonReply::Content(content) =
-            zg_daemon::execute_command(&home, DaemonCommand::ReadContent(request)).await?
-        else {
-            return Err(protocol_mismatch("read content"));
-        };
-        *content
-    } else {
-        let engine = ZvecGrep::new();
-        let content = engine.read_content(request).await;
-        engine.close();
-        content?
-    };
-    let bytes = match &result.content {
-        Content::Text(text) | Content::Code(text) => text.as_bytes(),
-        Content::Image(image) => image.data(),
-    };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    println!(
-        "Saved {} content ({} bytes): {}",
-        result.content.kind().as_str(),
-        bytes.len(),
-        output.display()
-    );
-    Ok(())
 }
 
 async fn execute_install_plan(args: &zg_cli::InstallArgs) -> Result<(), Box<dyn Error>> {
@@ -799,7 +752,11 @@ async fn use_server(mode: ClientMode, home: Option<&Path>) -> Result<bool, Box<d
         ClientMode::Direct => Ok(false),
         ClientMode::Server => Ok(true),
         ClientMode::Auto => {
-            let home = zg_daemon::resolve_home(home.map(Path::to_owned))?;
+            let home = match zg_daemon::resolve_home(home.map(Path::to_owned)) {
+                Ok(home) => home,
+                Err(zg_daemon::DaemonError::MissingHome) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
             Ok(zg_daemon::server_status(&home).await?.ready)
         }
     }

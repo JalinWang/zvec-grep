@@ -5,12 +5,8 @@ const SNAPSHOT_PNG: &[u8] = &[
     0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0, 3, 1,
     1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
-const SNAPSHOT_PNG_BASE64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-
 #[test]
-fn multimodal_targets_groups_and_snapshots_survive_direct_server_and_mcp()
--> Result<(), Box<dyn Error>> {
+fn multimodal_targets_and_groups_survive_direct_server_and_mcp() -> Result<(), Box<dyn Error>> {
     let _permit = server_test_permit();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_zg"));
     let home = TempDir::new()?;
@@ -21,24 +17,12 @@ fn multimodal_targets_groups_and_snapshots_survive_direct_server_and_mcp()
         configure_multimodal_command(command, &home, &workspace);
     })?;
     let port = guard.listen.parse::<SocketAddr>()?.port();
-    let mut image_reference = None;
     for query in [
         &["--vector", "orchard"][..],
         &["--input", "picture.png"][..],
     ] {
-        image_reference = Some(check_multimodal_queries(
-            &binary, &home, &workspace, port, query,
-        )?);
+        check_multimodal_queries(&binary, &home, &workspace, port, query)?;
     }
-    // Snapshot reads must work after the original image disappears, without refreshing.
-    std::fs::remove_file(workspace.path().join("picture.png"))?;
-    check_multimodal_snapshot(
-        &binary,
-        &home,
-        &workspace,
-        port,
-        &image_reference.expect("image result has a reference"),
-    )?;
     check_embedding_inheritance(&binary, &home, &workspace, embedding.address)?;
     assert_command_success(&guard.stop()?);
     Ok(())
@@ -50,14 +34,13 @@ fn check_multimodal_queries(
     workspace: &TempDir,
     port: u16,
     query: &[&str],
-) -> Result<serde_json::Value, Box<dyn Error>> {
+) -> Result<(), Box<dyn Error>> {
     let image_input = query[0] == "--input";
     let mcp_query = if image_input {
         json!({"queryImage": {"source": "path", "path": workspace.path().join(query[1])}})
     } else {
         json!({"vector": query[1]})
     };
-    let mut image_reference = None;
     for target in [Some("code"), Some("image"), None] {
         let mut direct_result = None;
         for mode in ["direct", "server"] {
@@ -97,9 +80,6 @@ fn check_multimodal_queries(
                 }
             }
             if mode == "direct" {
-                if target == Some("image") {
-                    image_reference = Some(items[0]["content_ref"].clone());
-                }
                 direct_result = Some(result);
             } else {
                 let direct = direct_result.as_ref().expect("direct query ran first");
@@ -114,7 +94,7 @@ fn check_multimodal_queries(
             }
         }
     }
-    Ok(image_reference.expect("image result has a reference"))
+    Ok(())
 }
 
 fn configure_multimodal_command(command: &mut Command, home: &TempDir, workspace: &TempDir) {
@@ -246,7 +226,7 @@ fn check_embedding_inheritance(
         for mode in ["direct", "server"] {
             let status = read_status(mode)?;
             let index = &status["workspace_index"];
-            assert_eq!(index["default_model_ref"], model);
+            assert_eq!(index["default_embedding_model_ref"], model);
             assert_eq!(index["embedding_routes"], json!({}));
             let actual_kinds = index["tables"]
                 .as_array()
@@ -273,7 +253,7 @@ fn search_projection(result: &serde_json::Value) -> serde_json::Value {
         .map(|item| {
             json!({
                 "rank": item["rank"], "path": item["relative_path"], "preview": item["preview"],
-                "reference": item["content_ref"], "score": item["score"],
+                "score": item["score"],
             })
         })
         .collect::<Vec<_>>();
@@ -328,14 +308,6 @@ fn assert_mcp_search_parity(
             "type: {}",
             item["preview"]["kind"].as_str().expect("kind")
         )));
-        let reference = json!({
-            "generation": item["content_ref"]["generation"],
-            "entityId": item["content_ref"]["entity_id"],
-        });
-        assert!(
-            remaining.contains(&format!("reference: {reference}")),
-            "{text}"
-        );
     }
     for group in expected["diagnostics"]["index"]["result_groups"]
         .as_array()
@@ -354,55 +326,6 @@ fn assert_mcp_search_parity(
             "{text}"
         );
     }
-    Ok(())
-}
-
-fn check_multimodal_snapshot(
-    binary: &Path,
-    home: &TempDir,
-    workspace: &TempDir,
-    port: u16,
-    reference: &serde_json::Value,
-) -> Result<(), Box<dyn Error>> {
-    for mode in ["direct", "server"] {
-        let destination = home.path().join(format!("snapshot-{mode}.png"));
-        let mut command = Command::new(binary);
-        configure_multimodal_command(&mut command, home, workspace);
-        let output = command
-            .args([
-                "--mode",
-                mode,
-                "--read-content",
-                reference["entity_id"].as_str().expect("entity id"),
-                "--generation",
-                reference["generation"].as_str().expect("generation"),
-                "--output",
-                path_text(&destination)?,
-            ])
-            .output()?;
-        assert_command_success(&output);
-        assert_eq!(std::fs::read(destination)?, SNAPSHOT_PNG);
-    }
-    let response = rpc(&modern_post(
-        port,
-        "tools/call",
-        json!({
-            "name": "zvec_grep_read_content", "arguments": {"root": workspace.path(), "reference": {
-                "generation": reference["generation"], "entityId": reference["entity_id"],
-            }},
-        }),
-        "",
-    )?);
-    assert!(response["error"].is_null(), "{response}");
-    assert_ne!(response["result"]["isError"], true, "{response}");
-    let image = response["result"]["content"]
-        .as_array()
-        .expect("MCP content")
-        .iter()
-        .find(|block| block["type"] == "image")
-        .expect("indexed image block");
-    assert_eq!(image["mimeType"], "image/png");
-    assert_eq!(image["data"], SNAPSHOT_PNG_BASE64);
     Ok(())
 }
 
@@ -487,7 +410,7 @@ fn modern_http_discovery_tools_errors_and_remote_continuation() -> Result<(), Bo
                         .as_array()
                         .expect("valid test fixture")
                         .len(),
-                    if toolset == "agent" { 2 } else { 7 }
+                    if toolset == "agent" { 1 } else { 6 }
                 );
                 let search = result["result"]["tools"]
                     .as_array()

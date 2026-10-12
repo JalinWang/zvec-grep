@@ -57,22 +57,21 @@ async fn fusion_model_keeps_indexed_entities_and_search_queries_in_separate_requ
     assert_eq!(server.requests.load(Ordering::Acquire), 2);
     assert_eq!(server.multimodal_inputs.load(Ordering::Acquire), 2);
 
-    let result = engine
-        .context(ContextOptions {
-            root: Some(root.to_path_buf()),
-            routes: ["orchard", "galaxy"]
-                .into_iter()
-                .map(|query| ContextRoute {
-                    mode: ContextRouteMode::Vector,
-                    query: query.into(),
-                })
-                .collect(),
-            auto_update: false,
-            allow_remote: true,
-            api_key: Some("local-test-key".into()),
-            ..ContextOptions::default()
-        })
-        .await?;
+    let query = ContextOptions {
+        root: Some(root.to_path_buf()),
+        routes: ["orchard", "galaxy"]
+            .into_iter()
+            .map(|query| ContextRoute {
+                mode: ContextRouteMode::Vector,
+                query: query.into(),
+            })
+            .collect(),
+        auto_update: false,
+        allow_remote: true,
+        api_key: Some("local-test-key".into()),
+        ..ContextOptions::default()
+    };
+    let result = engine.context(query.clone()).await?;
     let paths = result
         .items
         .iter()
@@ -84,6 +83,29 @@ async fn fusion_model_keeps_indexed_entities_and_search_queries_in_separate_requ
     );
     assert_eq!(server.requests.load(Ordering::Acquire), 4);
     assert_eq!(server.multimodal_inputs.load(Ordering::Acquire), 4);
+
+    let manifest_path = root.join(".zvec-grep/manifest.json");
+    let manifest = fs::read(&manifest_path)?;
+    let alternative = EmbeddingServer::start()?;
+    let overridden = engine
+        .context(ContextOptions {
+            endpoint: Some(format!("http://{}/embeddings", alternative.address)),
+            ..query
+        })
+        .await?;
+    assert_eq!(
+        overridden
+            .items
+            .iter()
+            .map(|item| item.relative_path.as_path())
+            .collect::<BTreeSet<_>>(),
+        paths
+    );
+    assert_eq!(alternative.requests.load(Ordering::Acquire), 2);
+    assert_eq!(alternative.multimodal_inputs.load(Ordering::Acquire), 2);
+    assert_eq!(server.requests.load(Ordering::Acquire), 4);
+    assert_eq!(fs::read(&manifest_path)?, manifest);
+
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
@@ -150,7 +172,7 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
     assert!(manifest.get("manifestVersion").is_none());
     assert_eq!(manifest["indexVersion"], 2);
     assert_eq!(
-        manifest["defaultModel"]["model"]["name"],
+        manifest["defaultEmbeddingModel"]["model"]["name"],
         "text-embedding-v4"
     );
     assert_eq!(manifest["embeddingRoutes"], json!({}));
@@ -196,24 +218,31 @@ fn fixture_image(format: image::ImageFormat, color: [u8; 3]) -> Vec<u8> {
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "exercises one persistent image lifecycle across indexing, reopen, content reads and deletion"
+    reason = "exercises one persistent image lifecycle across indexing, reopen and deletion"
 )]
 async fn image_routes_partition_search_and_preserve_content_across_reopen() -> TestResult {
     use zg_engine::api::{
-        content::{Content, ContentKind, ReadContentOptions},
+        context::options::ContentKind,
         context::{options::QueryImage, result::ContentPreview},
     };
     let temporary = tempdir()?;
     let root = temporary.path();
     let server = EmbeddingServer::start()?;
     configure_remote_model(root, server.address)?;
-    // A route's persisted provider credentials are independent of the default model.
-    let manifest_path = root.join(".zvec-grep/manifest.json");
-    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    manifest["embeddingRuntimes"]["qwen/qwen3-vl-embedding"] = json!({
-        "apiKey": "local-test-key", "endpoint": format!("http://{}/embeddings", server.address)
-    });
-    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    let mut engine = ZvecGrep::new();
+    // Save the image model's key through the public API before routing it separately.
+    engine
+        .index(IndexOptions {
+            embedding: Some(EmbeddingModelSpec {
+                reference: "qwen/qwen3-vl-embedding".into(),
+                endpoint: Some(format!("http://{}/embeddings", server.address)),
+                revision: None,
+                cache_dir: None,
+                device: Device::Auto,
+            }),
+            ..index_options(root)
+        })
+        .await?;
     fs::write(root.join("note.txt"), "Orchard textual documentation.")?;
     fs::write(
         root.join("code.rs"),
@@ -229,10 +258,10 @@ async fn image_routes_partition_search_and_preserve_content_across_reopen() -> T
         root.join("blue.webp"),
         fixture_image(image::ImageFormat::WebP, [0, 0, 255]),
     )?;
-    let mut engine = ZvecGrep::new();
     let indexed = engine
         .index(IndexOptions {
             rebuild: true,
+            endpoint: Some(format!("http://{}/embeddings", server.address)),
             embedding_routes: std::collections::BTreeMap::from([(
                 ContentKind::Image,
                 EmbeddingModelSpec {
@@ -259,7 +288,6 @@ async fn image_routes_partition_search_and_preserve_content_across_reopen() -> T
         3
     );
     assert_eq!(model_collections(&info.index_path)?.len(), 3);
-    let mut reference = None;
     for reopened in [false, true] {
         if reopened {
             engine.close();
@@ -295,8 +323,6 @@ async fn image_routes_partition_search_and_preserve_content_across_reopen() -> T
             panic!("image preview");
         };
         assert_eq!(*size_bytes, png.len() as u64);
-        reference = item.content_ref.clone();
-        assert!(reference.is_some());
         for kind in [ContentKind::Text, ContentKind::Code] {
             let text = engine
                 .context(ContextOptions {
@@ -315,50 +341,12 @@ async fn image_routes_partition_search_and_preserve_content_across_reopen() -> T
                     .all(|item| item.preview.kind() != ContentKind::Image)
             );
             assert!(text.items.iter().all(|item| item.preview.kind() == kind));
-            for item in &text.items {
-                let content = engine
-                    .read_content(ReadContentOptions {
-                        root: Some(root.into()),
-                        ..ReadContentOptions::new(
-                            item.content_ref.clone().expect("indexed reference"),
-                        )
-                    })
-                    .await?;
-                assert_eq!(content.content.kind(), item.preview.kind());
-                let text = match &content.content {
-                    Content::Text(text) | Content::Code(text) => text,
-                    other @ Content::Image(_) => panic!("unexpected complete content: {other:?}"),
-                };
-                assert_eq!(Some(text.as_str()), item.preview.text());
-                assert_eq!(content.path, item.absolute_path);
-            }
         }
     }
-    let reference = reference.expect("image fixture result");
     fs::remove_file(root.join("red.png"))?;
-    let content = engine
-        .read_content(ReadContentOptions {
-            root: Some(root.into()),
-            ..ReadContentOptions::new(reference.clone())
-        })
-        .await?;
-    let Content::Image(image) = content.content else {
-        panic!("complete image content");
-    };
-    assert_eq!(image.data(), png);
-    assert_eq!(content.path, fs::canonicalize(root)?.join("red.png"));
     let changed = engine.index(index_options(root)).await?;
     assert_eq!(changed.files_deleted, 1);
     assert_eq!(changed.files_unchanged, 4);
-    assert!(
-        engine
-            .read_content(ReadContentOptions {
-                root: Some(root.into()),
-                ..ReadContentOptions::new(reference)
-            })
-            .await
-            .is_err()
-    );
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
@@ -912,9 +900,9 @@ async fn public_engine_persists_searches_updates_and_drops_real_storage() -> Tes
             .expect("original workspace")
             .name,
     );
-    assert_ne!(after_rebuild.index_path, before_rebuild.index_path);
+    assert_eq!(after_rebuild.index_path, before_rebuild.index_path);
     assert!(after_rebuild.index_path.is_dir());
-    assert!(!before_rebuild.index_path.exists());
+    assert!(before_rebuild.index_path.exists());
     let rebuilt_query = engine
         .context(ContextOptions {
             root: Some(root.to_path_buf()),
@@ -976,8 +964,9 @@ async fn initial_build_publishes_successes_and_incrementally_retries_failed_file
     let status = info.status.expect("published status");
     assert_eq!((status.files_failed, status.files_indexed), (1, 1));
     assert_eq!(status.failed_files[0].path, Path::new("broken.txt"));
-    assert!(!home.join("build.json").exists());
-    assert_eq!(fs::read_dir(home.join("generations"))?.count(), 1);
+    assert!(!home.join("temp/build.json").exists());
+    assert!(!home.join("temp").exists());
+    assert!(home.join("index/schema.json").is_file());
     assert_eq!(
         fts_paths(&engine, root, "orchard").await?,
         [PathBuf::from("stable.txt")]
@@ -1047,13 +1036,14 @@ async fn rebuild_publishes_successful_files_and_records_failures_for_incremental
     assert_eq!(rebuilt.failed_files[0].path, Path::new("note.txt"));
     assert_eq!(server.inputs.load(Ordering::Acquire), original_inputs + 1);
     let published = engine.info(info_options(root)).await?;
-    assert_ne!(published.index_path, original_path);
-    assert!(!original_path.exists());
+    assert_eq!(published.index_path, original_path);
+    assert!(original_path.exists());
     let status = published.status.expect("published status");
     assert_eq!((status.files_indexed, status.files_failed), (1, 1));
     assert_eq!(status.failed_files[0].path, Path::new("note.txt"));
-    assert!(!home.join("build.json").exists());
-    assert_eq!(fs::read_dir(home.join("generations"))?.count(), 1);
+    assert!(!home.join("temp/build.json").exists());
+    assert!(!home.join("temp").exists());
+    assert!(home.join("index/schema.json").is_file());
     assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
     assert_eq!(
         fts_paths(&engine, root, "baseline").await?,
@@ -1300,8 +1290,7 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     engine.index(index_options(&original_root)).await?;
     let before = engine.context(query(&original_root, "orchard")).await?;
     assert_eq!(before.items.len(), 1);
-    let content_ref = before.items[0].content_ref.clone();
-    assert!(content_ref.is_some());
+    let preview = before.items[0].preview.clone();
     engine.close();
     drop(engine);
 
@@ -1313,7 +1302,7 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
         .context(query(&relocated_root.join("src"), "orchard"))
         .await?;
     assert_eq!(after.items.len(), 1);
-    assert_eq!(after.items[0].content_ref, content_ref);
+    assert_eq!(after.items[0].preview, preview);
     assert_eq!(after.items[0].relative_path, Path::new("src/note.txt"));
     assert_eq!(
         after.items[0].absolute_path,
@@ -1340,7 +1329,7 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     assert_eq!(updated.files_modified, 1);
     let result = engine.context(query(&relocated_root, "vineyard")).await?;
     assert_eq!(result.items.len(), 1);
-    assert_ne!(result.items[0].content_ref, content_ref);
+    assert_ne!(result.items[0].preview, preview);
     assert!(
         engine
             .context(query(&relocated_root, "orchard"))

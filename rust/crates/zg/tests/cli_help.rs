@@ -86,7 +86,7 @@ fn models_help_uses_the_rust_transformers_backend_name() {
 fn index_help_describes_the_optional_workspace_name() {
     let help = stdout(&["--index", "--help"]);
     assert!(help.contains("--name <NAME>"));
-    assert!(help.contains("defaults to root directory name"));
+    assert!(help.contains("defaults to its root directory name"));
     assert!(help.contains("Scan rules:"));
     assert!(help.contains("--embedding"));
     assert!(help.contains("image=default"));

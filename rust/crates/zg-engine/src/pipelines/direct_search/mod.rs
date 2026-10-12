@@ -208,7 +208,6 @@ fn context_from_lexical(
                         .as_ref()
                         .and_then(|value| value.metadata.as_ref())
                         .cloned(),
-                    content_ref: None,
                     container: container.map(|value| ContextContainer {
                         entity_id: None,
                         range: value.range.into(),
@@ -281,7 +280,6 @@ mod tests {
             &source[start_byte_offset..end_byte_offset],
             item.preview.text().expect("text preview")
         );
-        assert!(item.content_ref.is_none());
         assert!(
             item.preview
                 .text()

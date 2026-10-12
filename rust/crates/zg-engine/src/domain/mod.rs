@@ -3,6 +3,7 @@
 mod content;
 mod entity;
 mod glob;
+mod index;
 mod metadata;
 pub(crate) mod model;
 mod source;
@@ -21,6 +22,13 @@ pub(crate) use entity::FragmentId;
 
 // Glob rules.
 pub use glob::GlobRule;
+
+// Indexes.
+pub(crate) use index::ContentIndex;
+pub(crate) use index::FTS_CONFIG;
+pub(crate) use index::FtsConfig;
+pub(crate) use index::IndexDescriptor;
+pub(crate) use index::IndexState;
 
 // Metadata.
 pub use metadata::CodeMetadata;
@@ -48,10 +56,5 @@ pub(crate) use source::SourcePath;
 pub(crate) use source::TextRange;
 
 // Workspaces.
-pub(crate) use workspace::FTS_CONFIG;
-pub(crate) use workspace::FtsConfig;
-pub(crate) use workspace::IndexDescriptor;
-pub(crate) use workspace::IndexState;
-pub(crate) use workspace::IndexTable;
 pub use workspace::ScanRules;
 pub(crate) use workspace::Workspace;

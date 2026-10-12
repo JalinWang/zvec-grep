@@ -8,7 +8,7 @@ use crate::EngineError;
 use super::manifest::{delete_workspace_manifest, workspace_manifest_path};
 
 pub(crate) const ZVEC_GREP_DIRECTORY: &str = ".zvec-grep";
-const WORKSPACE_INDEX_DIRECTORY: &str = "storage";
+const WORKSPACE_INDEX_DIRECTORY: &str = "index";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkspaceIndexLocation {
@@ -60,7 +60,12 @@ pub(crate) fn find_nearest_workspace(
 
 pub(crate) fn reset_workspace_index(location: &WorkspaceIndexLocation) -> Result<(), EngineError> {
     super::build::drop_build_storage(&location.home)?;
-    delete_workspace_manifest(&location.home)
+    delete_workspace_manifest(&location.home)?;
+    match fs::remove_file(location.home.join("credentials.key")) {
+        Ok(()) => crate::utils::sync_directory(&location.home),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(workspace_io("remove workspace credentials key", &error)),
+    }
 }
 
 fn find_nearest_workspace_location(
@@ -107,7 +112,7 @@ mod tests {
         assert_eq!(location.root, directory.path());
         assert_eq!(location.home, directory.path().join(".zvec-grep"));
         assert_eq!(location.manifest_path, location.home.join("manifest.json"));
-        assert_eq!(location.index_path, location.home.join("storage"));
+        assert_eq!(location.index_path, location.home.join("index"));
     }
 
     #[test]
@@ -135,8 +140,8 @@ mod tests {
         let nested = directory.path().join("src/nested");
         fs::create_dir_all(&nested).expect("nested directory");
         let home = directory.path().join(".zvec-grep");
-        fs::create_dir(&home).expect("workspace home");
-        fs::write(home.join("build.json"), b"{}").expect("pending build marker");
+        fs::create_dir_all(home.join("temp")).expect("workspace home");
+        fs::write(home.join("temp/build.json"), b"{}").expect("pending build marker");
         assert!(!home.join("manifest.json").exists());
 
         let nearest = find_nearest_workspace(&nested)

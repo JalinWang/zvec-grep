@@ -75,7 +75,7 @@ pub fn write_info_with_options(
             &mut writer,
             theme,
             "Nested Git",
-            &[if index.scan.nested_git {
+            &[if index.scan.nested_git() {
                 "included"
             } else {
                 "excluded"
@@ -334,7 +334,7 @@ fn write_diagnostics(
 
 pub(crate) fn scan_filters(scan: &ScanRules) -> String {
     let mut filters: Vec<_> = scan
-        .globs
+        .globs()
         .iter()
         .map(|glob| {
             format!(
@@ -348,32 +348,32 @@ pub(crate) fn scan_filters(scan: &ScanRules) -> String {
             )
         })
         .collect();
-    if scan.hidden {
+    if scan.include_hidden() {
         filters.push("hidden".into());
     }
-    if scan.no_ignore {
+    if !scan.use_default_ignores() {
         filters.push("no-ignore".into());
     }
-    if !scan.ignore_files.is_empty() {
+    if !scan.ignore_files().is_empty() {
         filters.push(format!(
             "ignore-file={}",
-            scan.ignore_files
+            scan.ignore_files()
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join("|")
         ));
     }
-    if let Some(depth) = scan.max_depth {
+    if let Some(depth) = scan.max_depth() {
         filters.push(format!("max-depth={depth}"));
     }
-    if let Some(size) = scan.max_file_size_bytes {
+    if let Some(size) = scan.max_file_size_bytes() {
         filters.push(format!("max-filesize={size}"));
     }
-    if scan.follow_symlinks {
+    if scan.follow_symlinks() {
         filters.push("follow".into());
     }
-    if !scan.nested_git {
+    if !scan.nested_git() {
         filters.push("nested-git=false".into());
     }
     filters.join(" ")
@@ -393,7 +393,7 @@ mod tests {
             compatibility: IndexCompatibility::Compatible { version: 2 },
             index_policy: WorkspaceIndexPolicy::Enabled,
             home: "/workspace/.zvec-grep".into(),
-            index_path: "/workspace/.zvec-grep/storage".into(),
+            index_path: "/workspace/.zvec-grep/index".into(),
             source: InfoSource::Index,
             workspace_index: Some(WorkspaceIndexInfo {
                 name: "workspace".into(),
@@ -401,7 +401,7 @@ mod tests {
                 root: "/workspace".into(),
                 scan: ScanRules::default(),
                 policy: WorkspaceIndexPolicy::Enabled,
-                default_model_ref: Some("qwen/text-embedding-v4".into()),
+                default_embedding_model_ref: Some("qwen/text-embedding-v4".into()),
                 embedding_routes: std::collections::BTreeMap::default(),
                 tables: vec![WorkspaceIndexTable {
                     kind: zg_engine::api::context::options::ContentKind::Text,
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(
             render(&ready(), ColorMode::Never),
             format!(
-                "✓ Workspace index is ready\n  /workspace\n\n  Coverage    {bar} 100%  1,132 / 1,132 files\n  Entities    22,037\n  Source size 4,177,103 bytes\n  Queue       0 pending · 0 failed\n\n  text        qwen/text-embedding-v4 (1,024 dimensions, cosine) · 22,037 entities · ready\n  code        not enabled\n  image       not enabled\n  FTS         text/code: tokenizer=jieba filters=lowercase\n\n  Storage     .zvec-grep/storage\n  Version     2\n  Nested Git  included\n"
+                "✓ Workspace index is ready\n  /workspace\n\n  Coverage    {bar} 100%  1,132 / 1,132 files\n  Entities    22,037\n  Source size 4,177,103 bytes\n  Queue       0 pending · 0 failed\n\n  text        qwen/text-embedding-v4 (1,024 dimensions, cosine) · 22,037 entities · ready\n  code        not enabled\n  image       not enabled\n  FTS         text/code: tokenizer=jieba filters=lowercase\n\n  Storage     .zvec-grep/index\n  Version     2\n  Nested Git  included\n"
             )
         );
     }
@@ -596,11 +596,16 @@ mod tests {
     fn scan_scope_and_missing_embedding_remain_visible() {
         let mut info = ready();
         let index = info.workspace_index.as_mut().expect("workspace");
-        index.default_model_ref = None;
+        index.default_embedding_model_ref = None;
         index.tables.clear();
-        index.scan.globs = vec!["*.rs".into(), "!vendor/**".into()];
-        index.scan.hidden = true;
-        index.scan.max_depth = Some(0);
+        index.scan = zg_engine::api::index::options::ScanRulesUpdate {
+            globs: Some(vec!["*.rs".into(), "!vendor/**".into()]),
+            include_hidden: Some(true),
+            max_depth: Some(Some(0)),
+            ..Default::default()
+        }
+        .apply(&index.scan)
+        .expect("updated scan rules");
         let output = render(&info, ColorMode::Never);
         assert!(output.contains("text        not enabled"));
         assert!(

@@ -12,30 +12,29 @@ use crate::storage::{
 use zvec_rust::{Doc, SearchQuery};
 
 fn model() -> EmbeddingModelInfo {
-    EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: crate::domain::model::ModelInfo::new(
+    EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
             "fixture",
             "fixture",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    }
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("embedding metadata")
 }
 
 fn metadata_store(path: &Path) -> IndexStore {
     IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: path.to_owned(),
-        tables: vec![IndexTable {
+        tables: vec![ContentIndex {
             kind: ContentKind::Text,
             embedding: model(),
         }],
@@ -375,39 +374,45 @@ fn native_search_and_loading_preserve_compact_ids_without_reencoding() {
 #[test]
 fn entity_content_is_canonical_and_fragments_have_one_model() {
     let home = tempfile::tempdir().expect("storage");
-    let text = EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: crate::domain::model::ModelInfo::new(
+    let text = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
             "fixture",
             "fixture",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    };
-    let mut other = text.clone();
-    other.model = crate::domain::model::ModelInfo::new(
-        other.model.provider(),
-        "other",
-        other.model.content_kinds().iter().copied(),
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
     )
-    .expect("fixture model identity");
+    .expect("embedding metadata");
+    let other = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            text.model().provider(),
+            "other",
+            text.model().content_kinds().iter().copied(),
+            text.model().max_batch_size(),
+        )
+        .expect("fixture model identity"),
+        text.dimension(),
+        text.metric(),
+        text.max_input_tokens(),
+        text.max_image_bytes(),
+    )
+    .expect("embedding metadata");
     let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: home.path().to_owned(),
         tables: vec![
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Text,
                 embedding: text,
             },
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Code,
                 embedding: other,
             },
@@ -470,39 +475,45 @@ fn entity_content_is_canonical_and_fragments_have_one_model() {
 #[test]
 fn fragment_ids_cannot_be_reused_by_another_file_in_a_different_model_table() {
     let home = tempfile::tempdir().expect("storage");
-    let first = EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: crate::domain::model::ModelInfo::new(
+    let first = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
             "fixture",
             "fixture",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    };
-    let mut second = first.clone();
-    second.model = crate::domain::model::ModelInfo::new(
-        second.model.provider(),
-        "other",
-        second.model.content_kinds().iter().copied(),
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
     )
-    .expect("fixture model identity");
+    .expect("embedding metadata");
+    let second = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            first.model().provider(),
+            "other",
+            first.model().content_kinds().iter().copied(),
+            first.model().max_batch_size(),
+        )
+        .expect("fixture model identity"),
+        first.dimension(),
+        first.metric(),
+        first.max_input_tokens(),
+        first.max_image_bytes(),
+    )
+    .expect("embedding metadata");
     let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: home.path().to_owned(),
         tables: vec![
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Text,
                 embedding: first,
             },
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Code,
                 embedding: second,
             },
@@ -718,8 +729,7 @@ fn maximum_u32_directory_id_survives_reopen_and_filters_both_retrieval_collectio
     metadata_store(temporary.path())
         .close()
         .expect("create tables");
-    let directory_table =
-        Directories::open(&temporary.path().join("storage"), false).expect("directory table");
+    let directory_table = Directories::open(temporary.path(), false).expect("directory table");
     let mut doc = Doc::new().expect("directory doc");
     doc.set_pk(&format!("d{}", u32::MAX));
     doc.add_u32("directory_id", u32::MAX).expect("directory ID");

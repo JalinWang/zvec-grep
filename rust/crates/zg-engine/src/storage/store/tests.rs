@@ -344,7 +344,7 @@ fn failed_files_retain_queryable_paths_and_directory_ownership() {
     );
     storage.close().expect("checkpoint");
 
-    let path = temporary.path().join("storage/files");
+    let path = temporary.path().join("files");
     let mut options = zvec_rust::CollectionOptions::new().expect("options");
     options.set_read_only(true).expect("read only");
     #[cfg(windows)]
@@ -408,42 +408,46 @@ fn query_attributes_follow_replacement_failure_deletion_and_reopen() {
     reopened.close().expect("close");
 }
 
-fn text_table(embedding: EmbeddingModelInfo) -> IndexTable {
-    IndexTable {
+fn text_table(embedding: EmbeddingModelInfo) -> ContentIndex {
+    ContentIndex {
         kind: ContentKind::Text,
         embedding,
     }
 }
 
 fn schema() -> EmbeddingModelInfo {
-    EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: crate::domain::model::ModelInfo::new(
+    EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
             "fixture",
             "fixture-model",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    }
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("embedding metadata")
 }
 
 #[test]
-fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
+fn stored_model_info_preserves_metadata_and_accepts_runtime_changes() {
     let directory = tempfile::tempdir().expect("fixture directory");
     let home = directory.path();
-    let mut original = schema();
-    original.metric = EmbeddingMetric::DotProduct;
-    original.max_input_tokens = Some(8192);
-    original.max_image_bytes = Some(1_048_576);
+    let base = schema();
+    let original = EmbeddingModelInfo::new(
+        base.model().clone(),
+        base.dimension(),
+        EmbeddingMetric::DotProduct,
+        Some(8192),
+        Some(1_048_576),
+    )
+    .expect("embedding metadata");
     IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: home.to_owned(),
         tables: vec![text_table(original.clone())],
@@ -451,7 +455,7 @@ fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
     .expect("create index")
     .close()
     .expect("close index");
-    let descriptor = home.join("storage/schema.json");
+    let descriptor = home.join("schema.json");
     let persisted = fs::read(&descriptor).expect("read descriptor");
     let record: serde_json::Value = serde_json::from_slice(&persisted).expect("descriptor JSON");
     assert_eq!(
@@ -466,69 +470,117 @@ fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
         vec![text_table(original.clone())]
     );
 
-    let mut current = original.clone();
-    current.max_batch_size = 64;
+    for field in [
+        "max_batch_size",
+        "max_input_tokens",
+        "max_image_bytes",
+        "fewer_content_kinds",
+        "more_content_kinds",
+    ] {
+        let model = original.model();
+        let mut batch_size = model.max_batch_size();
+        let mut kinds = model.content_kinds().to_vec();
+        let mut max_input_tokens = original.max_input_tokens();
+        let mut max_image_bytes = original.max_image_bytes();
+        match field {
+            "max_batch_size" => batch_size = 64,
+            "max_input_tokens" => max_input_tokens = Some(4096),
+            "max_image_bytes" => max_image_bytes = None,
+            "fewer_content_kinds" => kinds = vec![ContentKind::Text],
+            "more_content_kinds" => kinds.push(ContentKind::Image),
+            _ => unreachable!(),
+        }
+        let current = EmbeddingModelInfo::new(
+            crate::domain::model::ModelInfo::new(model.provider(), model.name(), kinds, batch_size)
+                .expect("updated model identity"),
+            original.dimension(),
+            original.metric(),
+            max_input_tokens,
+            max_image_bytes,
+        )
+        .expect("updated embedding metadata");
+        IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.to_owned(),
+            tables: vec![text_table(current)],
+        })
+        .expect("runtime metadata changes do not invalidate an index")
+        .close()
+        .expect("close reused index");
+    }
 
-    IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
-        storage_path: home.to_owned(),
-        tables: vec![text_table(current.clone())],
-    })
-    .expect("runtime metadata changes do not invalidate an index")
-    .close()
-    .expect("close reused index");
-
-    let mut invalid = current.clone();
-    invalid.max_batch_size = 0;
+    let invalid = EmbeddingModelInfo::new(
+        original.model().clone(),
+        20_001,
+        original.metric(),
+        original.max_input_tokens(),
+        original.max_image_bytes(),
+    )
+    .expect("valid metadata with unsupported storage dimension");
     let error = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: home.to_owned(),
         tables: vec![text_table(invalid)],
     })
     .err()
-    .expect("reopening must validate incoming metadata too");
+    .expect("reopening must enforce the native storage dimension limit");
     assert_eq!(error.code(), EngineError::INVALID_ARGUMENT);
-    assert!(error.message().contains("max_batch_size"));
+    assert!(error.message().contains("dimension"));
+    assert_eq!(
+        fs::read(descriptor).expect("unchanged descriptor"),
+        persisted
+    );
+}
 
-    for field in [
-        "provider",
-        "name",
-        "content_kinds",
-        "dimension",
-        "metric",
-        "max_input_tokens",
-        "max_image_bytes",
-    ] {
-        let mut changed = current.clone();
+#[test]
+fn stored_model_identity_changes_require_rebuild() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let home = directory.path();
+    let original = schema();
+    IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
+        storage_path: home.to_owned(),
+        tables: vec![text_table(original.clone())],
+    })
+    .expect("create index")
+    .close()
+    .expect("close index");
+    let descriptor = home.join("schema.json");
+    let persisted = fs::read(&descriptor).expect("read descriptor");
+
+    for field in ["provider", "name", "dimension", "metric"] {
+        let mut model = original.model().clone();
+        let mut dimension = original.dimension();
+        let mut metric = original.metric();
         match field {
             "provider" => {
-                changed.model = crate::domain::model::ModelInfo::new(
+                model = crate::domain::model::ModelInfo::new(
                     "other",
-                    changed.model.name(),
-                    changed.model.content_kinds().iter().copied(),
+                    model.name(),
+                    model.content_kinds().iter().copied(),
+                    model.max_batch_size(),
                 )
                 .expect("fixture model identity");
             }
             "name" => {
-                changed.model = crate::domain::model::ModelInfo::new(
-                    changed.model.provider(),
+                model = crate::domain::model::ModelInfo::new(
+                    model.provider(),
                     "other",
-                    changed.model.content_kinds().iter().copied(),
+                    model.content_kinds().iter().copied(),
+                    model.max_batch_size(),
                 )
                 .expect("fixture model identity");
             }
-            "content_kinds" => {
-                changed.model = crate::domain::model::ModelInfo::new(
-                    changed.model.provider(),
-                    changed.model.name(),
-                    [crate::domain::ContentKind::Text],
-                )
-                .expect("different content kinds");
-            }
-            "dimension" => changed.dimension += 1,
-            "metric" => changed.metric = EmbeddingMetric::Cosine,
-            "max_input_tokens" => changed.max_input_tokens = Some(4096),
-            "max_image_bytes" => changed.max_image_bytes = None,
+            "dimension" => dimension += 1,
+            "metric" => metric = EmbeddingMetric::DotProduct,
             _ => unreachable!(),
         }
+        let changed = EmbeddingModelInfo::new(
+            model,
+            dimension,
+            metric,
+            original.max_input_tokens(),
+            original.max_image_bytes(),
+        )
+        .expect("changed embedding metadata");
+        let current_reference = changed.model().reference();
         let error = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: home.to_owned(),
             tables: vec![text_table(changed)],
@@ -536,6 +588,22 @@ fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
         .err()
         .expect("index fields must match");
         assert!(error.message().contains("rebuild the index"), "{field}");
+        assert!(
+            error.message().contains(&original.model().reference()),
+            "{field}"
+        );
+        assert!(error.message().contains(&current_reference), "{field}");
+        let reason = match field {
+            "provider" | "name" => "model reference changed".to_owned(),
+            "dimension" => format!(
+                "dimension changed from {} to {}",
+                original.dimension(),
+                original.dimension() + 1,
+            ),
+            "metric" => "metric changed from Cosine to DotProduct".to_owned(),
+            _ => unreachable!(),
+        };
+        assert!(error.message().contains(&reason), "{}", error.message());
     }
     assert_eq!(
         fs::read(descriptor).expect("unchanged descriptor"),
@@ -546,12 +614,22 @@ fn stored_model_info_preserves_metadata_and_only_checks_index_fields() {
 #[test]
 fn rejects_corrupt_embedding_limits_before_opening_native_storage() {
     let directory = tempfile::tempdir().expect("fixture directory");
-    let path = directory.path().join("storage");
-    fs::create_dir(&path).expect("storage directory");
-    for field in ["maxBatchSize", "maxInputTokens", "maxImageBytes"] {
+    let path = directory.path().to_path_buf();
+    fs::create_dir_all(&path).expect("storage directory");
+    for field in [
+        "dimension",
+        "maxBatchSize",
+        "maxInputTokens",
+        "maxImageBytes",
+    ] {
         let mut record = serde_json::to_value(SchemaRecord::new(&[text_table(schema())]))
             .expect("descriptor JSON");
-        record["tables"][0]["embedding"][field] = serde_json::json!(0);
+        let embedding = &mut record["tables"][0]["embedding"];
+        if field == "maxBatchSize" {
+            embedding["model"][field] = serde_json::json!(0);
+        } else {
+            embedding[field] = serde_json::json!(0);
+        }
         fs::write(
             path.join("schema.json"),
             serde_json::to_vec(&record).expect("encode descriptor"),
@@ -568,21 +646,18 @@ fn rejects_corrupt_embedding_limits_before_opening_native_storage() {
         ] {
             let error = IndexStore::open(options).err().expect("corrupt metadata");
             assert_eq!(error.code(), EngineError::STORAGE_FAILURE);
-            assert!(
-                error
-                    .message()
-                    .contains("invalid stored index table information")
-            );
+            assert!(error.message().contains("greater than zero"), "{field}");
+            assert!(error.message().contains("rebuild the index"));
         }
     }
-    assert_eq!(fs::read_dir(path).expect("storage files").count(), 1);
+    assert_eq!(fs::read_dir(path).expect("storage files").count(), 2);
 }
 
 #[test]
 fn initializes_schema_only_in_empty_storage() {
     let directory = tempfile::tempdir().expect("fixture directory");
-    let path = directory.path().join("storage");
-    fs::create_dir(&path).expect("empty storage directory");
+    let path = directory.path().to_path_buf();
+    fs::create_dir_all(&path).expect("empty storage directory");
     open(directory.path(), false)
         .close()
         .expect("initialize empty storage");
@@ -596,7 +671,7 @@ fn initializes_schema_only_in_empty_storage() {
 fn rejects_existing_collections_without_schema_before_opening_them() {
     for collection in ["files", "directories", "entities", "fragments_existing"] {
         let directory = tempfile::tempdir().expect("fixture directory");
-        let path = directory.path().join("storage");
+        let path = directory.path().to_path_buf();
         let collection_path = path.join(collection);
         fs::create_dir_all(&collection_path).expect("existing collection");
         let marker = collection_path.join("preserved");
@@ -967,8 +1042,15 @@ fn rejects_invalid_writes_without_poisoning_storage() {
         "readers cannot open during a writer lease"
     );
     storage.close().expect("close writer");
-    let mut incompatible = schema();
-    incompatible.dimension = 4;
+    let original = schema();
+    let incompatible = EmbeddingModelInfo::new(
+        original.model().clone(),
+        4,
+        original.metric(),
+        original.max_input_tokens(),
+        original.max_image_bytes(),
+    )
+    .expect("incompatible embedding metadata");
     assert!(
         IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: home.to_owned(),
@@ -1187,7 +1269,7 @@ fn directory_collection_preserves_membership_after_reopen_and_replacement() {
         .replace_fixture_file(&file, &[entry])
         .expect("indexed source");
     storage.close().expect("checkpoint");
-    assert!(home.path().join("storage/directories").is_dir());
+    assert!(home.path().join("directories").is_dir());
     let filter = StorageSearchFilter {
         path: Some(StoragePathFilter::Directory(
             crate::domain::SourcePath::new("src").expect("path"),
@@ -1220,30 +1302,43 @@ fn directory_collection_preserves_membership_after_reopen_and_replacement() {
     reader.close().expect("close reader");
 }
 
-fn multi_model_schema() -> Vec<IndexTable> {
-    let mut text = schema();
-    text.model = crate::domain::model::ModelInfo::new(
-        text.model.provider(),
-        text.model.name(),
-        [
-            crate::domain::ContentKind::Text,
-            crate::domain::ContentKind::Code,
-            crate::domain::ContentKind::Image,
-        ],
+fn multi_model_schema() -> Vec<ContentIndex> {
+    let base = schema();
+    let text = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            base.model().provider(),
+            base.model().name(),
+            [
+                crate::domain::ContentKind::Text,
+                crate::domain::ContentKind::Code,
+                crate::domain::ContentKind::Image,
+            ],
+            base.model().max_batch_size(),
+        )
+        .expect("multimodal fixture"),
+        base.dimension(),
+        base.metric(),
+        base.max_input_tokens(),
+        base.max_image_bytes(),
     )
-    .expect("multimodal fixture");
-    text.retrieval = crate::domain::model::EmbeddingRetrieval::TextImage;
-    let mut vision = text.clone();
-    vision.model = crate::domain::model::ModelInfo::new(
-        vision.model.provider(),
-        "vision",
-        vision.model.content_kinds().iter().copied(),
+    .expect("multimodal metadata");
+    let vision = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            text.model().provider(),
+            "vision",
+            text.model().content_kinds().iter().copied(),
+            text.model().max_batch_size(),
+        )
+        .expect("fixture model identity"),
+        2,
+        text.metric(),
+        text.max_input_tokens(),
+        text.max_image_bytes(),
     )
-    .expect("fixture model identity");
-    vision.dimension = 2;
+    .expect("vision metadata");
     vec![
         text_table(text),
-        IndexTable {
+        ContentIndex {
             kind: ContentKind::Image,
             embedding: vision,
         },
@@ -1382,7 +1477,7 @@ fn model_tables_partition_fragments_and_failed_files_clear_every_partition() {
         .expect("complete file");
     writer.close().expect("checkpoint");
 
-    let storage_path = home.path().join("storage");
+    let storage_path = home.path().to_path_buf();
     let mut collections = fs::read_dir(&storage_path)
         .expect("storage layout")
         .map(|entry| entry.expect("directory entry"))
@@ -1514,7 +1609,7 @@ fn shared_model_kinds_have_separate_tables_and_filter_before_top_k() {
         storage_path: home.path().to_owned(),
         tables: [ContentKind::Text, ContentKind::Code, ContentKind::Image]
             .into_iter()
-            .map(|kind| IndexTable {
+            .map(|kind| ContentIndex {
                 kind,
                 embedding: model.clone(),
             })
@@ -1567,7 +1662,7 @@ fn shared_model_kinds_have_separate_tables_and_filter_before_top_k() {
         assert_eq!(schema.has_index("text"), kind != ContentKind::Image);
         assert!(
             home.path()
-                .join("storage")
+                .to_path_buf()
                 .join(fragments::fragment_collection_name(kind))
                 .is_dir()
         );
@@ -1640,8 +1735,8 @@ fn five_mebibyte_canonical_image_roundtrips_and_disappears_after_deletion() {
 #[test]
 fn previous_development_schema_requires_rebuild_without_mutating_storage() {
     let home = tempfile::tempdir().expect("workspace");
-    let storage = home.path().join("storage");
-    fs::create_dir(&storage).expect("storage directory");
+    let storage = home.path().to_path_buf();
+    fs::create_dir_all(&storage).expect("storage directory");
     let bytes =
         serde_json::to_vec(&serde_json::json!({"embeddings": [schema()]})).expect("old schema");
     fs::write(storage.join("schema.json"), &bytes).expect("write old schema");
@@ -1660,7 +1755,7 @@ fn previous_development_schema_requires_rebuild_without_mutating_storage() {
             fs::read(storage.join("schema.json")).expect("unchanged schema"),
             bytes
         );
-        assert_eq!(fs::read_dir(&storage).expect("directory").count(), 1);
+        assert_eq!(fs::read_dir(&storage).expect("directory").count(), 2);
     }
 }
 
@@ -1668,7 +1763,7 @@ fn previous_development_schema_requires_rebuild_without_mutating_storage() {
 fn missing_kind_table_requires_rebuild_instead_of_opening_an_empty_table() {
     let home = tempfile::tempdir().expect("workspace");
     open(home.path(), false).close().expect("create storage");
-    let missing = home.path().join("storage/fragments_text");
+    let missing = home.path().join("fragments_text");
     fs::remove_dir_all(&missing).expect("simulate lost collection");
     for options in [
         WorkspaceIndexStorageOptions::ReadOnly {
@@ -1761,8 +1856,15 @@ fn vector_scores_follow_relevance_for_cosine_dot_product_and_euclidean() {
         EmbeddingMetric::Euclidean,
     ] {
         let home = tempfile::tempdir().expect("workspace");
-        let mut model = schema();
-        model.metric = metric;
+        let base = schema();
+        let model = EmbeddingModelInfo::new(
+            base.model().clone(),
+            base.dimension(),
+            metric,
+            base.max_input_tokens(),
+            base.max_image_bytes(),
+        )
+        .expect("metric metadata");
         let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: home.path().to_owned(),
             tables: vec![text_table(model)],

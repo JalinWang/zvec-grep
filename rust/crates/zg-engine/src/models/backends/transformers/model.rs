@@ -128,22 +128,13 @@ impl TransformersEmbeddingModel {
             .unwrap_or_else(default_model_cache_dir);
         Ok(Self {
             entry,
-            info: EmbeddingModelInfo {
-                space: EmbeddingCatalogEntry::Transformers(entry).embedding_space(None),
-                retrieval: EmbeddingCatalogEntry::Transformers(entry).retrieval(),
-                model: EmbeddingCatalogEntry::Transformers(entry)
-                    .model_info()
-                    .map_err(|error| {
-                        ModelError::internal("invalid catalog model info")
-                            .with_cause(error)
-                            .shared()
-                    })?,
-                dimension: entry.dimension,
-                metric: entry.metric,
-                max_batch_size: entry.max_batch_size,
-                max_input_tokens: Some(entry.max_input_tokens),
-                max_image_bytes: None,
-            },
+            info: EmbeddingCatalogEntry::Transformers(entry)
+                .embedding_model_info()
+                .map_err(|error| {
+                    ModelError::internal("invalid catalog model info")
+                        .with_cause(error)
+                        .shared()
+                })?,
             model_cache_dir,
             device: options.device,
             compute_runtime,
@@ -256,6 +247,10 @@ impl TransformersEmbeddingModel {
 
 #[async_trait]
 impl EmbeddingModel for TransformersEmbeddingModel {
+    fn has_pinned_weights(&self) -> bool {
+        true
+    }
+
     fn info(&self) -> &EmbeddingModelInfo {
         &self.info
     }

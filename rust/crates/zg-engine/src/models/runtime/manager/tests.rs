@@ -21,24 +21,23 @@ struct ConcurrentFixtureModel {
 impl ConcurrentFixtureModel {
     fn new() -> Self {
         Self {
-            info: EmbeddingModelInfo {
-                space: crate::domain::model::EmbeddingSpace::fixture(),
-                retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-                model: crate::domain::model::ModelInfo::new(
+            info: EmbeddingModelInfo::new(
+                crate::domain::model::ModelInfo::new(
                     "local",
                     "fixture",
                     [
                         crate::domain::ContentKind::Text,
                         crate::domain::ContentKind::Code,
                     ],
+                    8,
                 )
                 .expect("fixture model identity"),
-                dimension: 1,
-                metric: EmbeddingMetric::Cosine,
-                max_batch_size: 8,
-                max_input_tokens: Some(32),
-                max_image_bytes: None,
-            },
+                1,
+                EmbeddingMetric::Cosine,
+                Some(32),
+                None,
+            )
+            .expect("fixture embedding model"),
             barrier: Barrier::new(2),
             active: AtomicUsize::new(0),
             maximum_active: AtomicUsize::new(0),
@@ -144,19 +143,19 @@ impl EmbeddingModel for ProgressFixtureModel {
     async fn prepare(&self, options: EmbeddingPrepareOptions) -> Result<(), ModelError> {
         if let Some(on_progress) = options.on_progress {
             on_progress(crate::domain::model::ModelProgress::Preparing {
-                model_ref: self.info.model.reference(),
+                model_ref: self.info.model().reference(),
             });
             on_progress(crate::domain::model::ModelProgress::Downloading {
-                model_ref: self.info.model.reference(),
+                model_ref: self.info.model().reference(),
                 downloaded_bytes: Some(4),
                 total_bytes: Some(8),
             });
             on_progress(crate::domain::model::ModelProgress::Warning {
-                model_ref: self.info.model.reference(),
+                model_ref: self.info.model().reference(),
                 message: "fixture warning".to_owned(),
             });
             on_progress(crate::domain::model::ModelProgress::Ready {
-                model_ref: self.info.model.reference(),
+                model_ref: self.info.model().reference(),
             });
         }
         Ok(())
@@ -481,30 +480,28 @@ fn concurrent_final_releases_cannot_mark_new_leases_idle() {
 }
 
 #[test]
-fn invalid_model_info_is_rejected_before_caching_or_leasing() {
-    for field in [
-        "dimension",
-        "max_batch_size",
-        "max_input_tokens",
-        "max_image_bytes",
-    ] {
+fn failed_model_construction_is_not_cached_and_can_be_retried() {
+    for field in ["dimension", "max_input_tokens", "max_image_bytes"] {
         let creations = Arc::new(AtomicUsize::new(0));
         let observed_creations = Arc::clone(&creations);
         let manager = ModelRuntimeManager::with_factory(move |_, _, _| {
             let mut model = ConcurrentFixtureModel::new();
-            if observed_creations.fetch_add(1, Ordering::AcqRel) == 0 {
-                match field {
-                    "dimension" => model.info.dimension = 0,
-                    "max_batch_size" => model.info.max_batch_size = 0,
-                    "max_input_tokens" => model.info.max_input_tokens = Some(0),
-                    "max_image_bytes" => model.info.max_image_bytes = Some(0),
-                    _ => unreachable!(),
-                }
-            } else {
-                // Optional limits may be absent; this does not invalidate the model.
-                model.info.max_input_tokens = None;
-                model.info.max_image_bytes = None;
-            }
+            let invalid = observed_creations.fetch_add(1, Ordering::AcqRel) == 0;
+            model.info = EmbeddingModelInfo::new(
+                model.info.model().clone(),
+                if invalid && field == "dimension" {
+                    0
+                } else {
+                    model.info.dimension()
+                },
+                model.info.metric(),
+                (invalid && field == "max_input_tokens").then_some(0),
+                (invalid && field == "max_image_bytes").then_some(0),
+            )
+            .map_err(|error| {
+                ModelError::internal("Failed to construct embedding model metadata")
+                    .with_cause(error)
+            })?;
             Ok(Arc::new(model))
         });
         let request = || ModelRuntimeRequest::new("local/fixture", ModelConfig::default(), None);
@@ -517,7 +514,7 @@ fn invalid_model_info_is_rejected_before_caching_or_leasing() {
             .expect("retry constructs a valid model");
         assert_eq!(creations.load(Ordering::Acquire), 2);
         assert_eq!(manager.snapshot().active_leases, 1);
-        assert_eq!(lease.info().model.reference(), "local/fixture");
+        assert_eq!(lease.info().model().reference(), "local/fixture");
     }
 }
 
@@ -561,7 +558,7 @@ async fn reuses_one_runtime_and_allows_shared_concurrent_embeddings() {
 
     assert_eq!(creations.load(Ordering::Acquire), 1);
     assert!(Arc::ptr_eq(&first.entry.runtime, &second.entry.runtime));
-    assert_eq!(first.info().model.reference(), "local/fixture");
+    assert_eq!(first.info().model().reference(), "local/fixture");
     assert_eq!(
         manager.snapshot(),
         ModelRuntimeSnapshot {
@@ -831,6 +828,7 @@ fn concurrency_policy_prefers_user_and_preserves_catalog_backend_defaults() {
             .expect("catalog model should be created without loading resources");
         assert_eq!(lease.operation.limit, initial, "{reference}");
         assert_eq!(lease.concurrency_defaults().maximum, maximum, "{reference}");
+        assert_eq!(lease.has_pinned_weights(), reference.starts_with("local/"));
         let explicit = manager
             .acquire(ModelRuntimeRequest::new(reference, config, Some(24)))
             .expect("explicit concurrency");
@@ -862,7 +860,7 @@ fn rejects_zero_user_concurrency_before_constructing_a_runtime() {
 }
 
 #[test]
-fn endpoints_separate_runtimes_and_persisted_encoding_identity() {
+fn endpoints_separate_runtimes_without_changing_model_compatibility() {
     let manager = ModelRuntimeManager::new();
     let acquire = |endpoint: &str| {
         manager
@@ -877,14 +875,19 @@ fn endpoints_separate_runtimes_and_persisted_encoding_identity() {
             ))
             .expect("remote runtime without an embedding request")
     };
-    let first = acquire("https://first.example.test/embeddings");
+    let first = acquire("https://FIRST.example.test:443/embeddings");
     let second = acquire("https://second.example.test/embeddings");
 
-    assert_ne!(first.info().space, second.info().space);
+    assert_eq!(first.info(), second.info());
+    first
+        .info()
+        .ensure_index_compatible(second.info())
+        .expect("different connections to the same model preserve index compatibility");
+    assert!(!first.has_pinned_weights());
     assert!(!Arc::ptr_eq(&first.entry, &second.entry));
     assert_eq!(
         first.configured_endpoint(),
-        Some("https://first.example.test/embeddings")
+        Some("https://FIRST.example.test:443/embeddings")
     );
     assert_eq!(
         second.configured_endpoint(),

@@ -15,7 +15,7 @@ use crate::{
     models::{
         catalog::{EmbeddingCatalogEntry, get_embedding_model_catalog_entry},
         runtime::ModelComputeRuntime,
-        spi::{EmbeddingModel, EmbeddingOptions, EmbeddingPrepareOptions},
+        spi::{EmbeddingModel, EmbeddingOptions, EmbeddingPrepareOptions, QueryEncoding},
     },
 };
 
@@ -49,30 +49,43 @@ fn encoded_image(color: [u8; 3], format: ImageFormat) -> Vec<u8> {
 fn catalog_pins_native_multimodal_model() {
     let model = model(PathBuf::from("unused-test-cache"));
     let info = model.info();
-    assert_eq!(info.dimension, 768);
-    assert_eq!(info.max_input_tokens, Some(8192));
-    assert_eq!(info.max_batch_size, 1);
+    assert_eq!(info.dimension(), 768);
+    assert_eq!(info.max_input_tokens(), Some(8192));
+    assert_eq!(info.model().max_batch_size(), 1);
     assert_eq!(
-        info.model.content_kinds(),
+        info.model().content_kinds(),
         &[ContentKind::Text, ContentKind::Code, ContentKind::Image]
     );
-    info.validate().expect("valid metadata");
 }
 
 #[test]
 fn prompts_apply_only_to_text_and_preserve_media_order() {
+    let model = model(PathBuf::from("unused-test-cache"));
     assert_eq!(
-        format_text("sample", EmbeddingPurpose::Document, false),
+        format_text("sample", EmbeddingPurpose::Document, QueryEncoding::Default),
         "title: none | text: sample"
     );
     assert_eq!(
-        format_text("sample", EmbeddingPurpose::Query, false),
+        format_text("sample", EmbeddingPurpose::Query, QueryEncoding::Default),
         "task: search result | query: sample"
     );
-    assert_eq!(
-        format_text("sample", EmbeddingPurpose::Query, true),
-        "task: code retrieval | query: sample"
-    );
+    for input in [ContentKind::Text, ContentKind::Code] {
+        for (target, expected) in [
+            (ContentKind::Text, "task: search result | query: sample"),
+            (ContentKind::Image, "task: search result | query: sample"),
+            (ContentKind::Code, "task: code retrieval | query: sample"),
+        ] {
+            let encoding = model.query_encoding(input, target);
+            assert_eq!(
+                format_text("sample", EmbeddingPurpose::Query, encoding),
+                expected
+            );
+            assert_eq!(
+                format_text("sample", EmbeddingPurpose::Document, encoding),
+                "title: none | text: sample"
+            );
+        }
+    }
     assert_eq!(image_placeholder(2), "<|image><|image|><|image|><image|>");
 }
 
@@ -276,7 +289,7 @@ async fn real_embeddinggemma2_text_image_fusion_and_recovery() {
                     &query,
                     EmbeddingOptions {
                         purpose: EmbeddingPurpose::Query,
-                        query_target: Some(target),
+                        query_encoding: model.query_encoding(ContentKind::Text, target),
                         ..EmbeddingOptions::default()
                     },
                 )

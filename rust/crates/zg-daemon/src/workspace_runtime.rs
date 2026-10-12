@@ -1239,6 +1239,7 @@ fn index_template(options: &IndexOptions) -> IndexOptions {
     template.allow_remote = false;
     template.authorized_remote.clear();
     template.runtime_device = None;
+    template.api_key = None;
     template.rebuild = false;
     template.reset_paths = false;
     template.changes.clear();
@@ -1478,7 +1479,7 @@ mod tests {
             compatibility: IndexCompatibility::Compatible { version: 2 },
             index_policy: WorkspaceIndexPolicy::Enabled,
             home: "/workspace/.zvec-grep".into(),
-            index_path: "/workspace/.zvec-grep/storage".into(),
+            index_path: "/workspace/.zvec-grep/index".into(),
             source: InfoSource::Index,
             workspace_index: None,
             status: Some(IndexStats::default()),
@@ -2281,7 +2282,7 @@ mod tests {
                     }],
                     scan: ScanRulesUpdate {
                         globs: Some(vec!["*.rs".into()]),
-                        hidden: Some(false),
+                        include_hidden: Some(false),
                         max_depth: Some(None),
                         ..ScanRulesUpdate::default()
                     },
@@ -2367,7 +2368,7 @@ mod tests {
                     root: Some(root.clone()),
                     embedding_concurrency: Some(5),
                     scan: ScanRulesUpdate {
-                        hidden: Some(true),
+                        include_hidden: Some(true),
                         ..ScanRulesUpdate::default()
                     },
                     ..IndexOptions::default()
@@ -2458,7 +2459,7 @@ mod tests {
                     root: Some(root.clone()),
                     embedding_concurrency: Some(99),
                     scan: ScanRulesUpdate {
-                        hidden: Some(true),
+                        include_hidden: Some(true),
                         ..ScanRulesUpdate::default()
                     },
                     ..IndexOptions::default()

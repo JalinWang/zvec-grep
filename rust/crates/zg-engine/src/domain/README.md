@@ -11,3 +11,4 @@ Source files remain untouched. Files are extracted into entities that carry cont
 1. **Metadata** describes category-specific attributes of content, such as a code symbol’s name and kind.
 1. **Entity** combines content, source references, and metadata into a logical search unit.
 1. **Model** defines model identity, configuration, and execution progress.
+1. **Index** defines embedding model routing, per-content-kind retrieval tables, and full-text configuration.

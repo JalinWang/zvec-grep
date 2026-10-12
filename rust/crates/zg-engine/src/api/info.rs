@@ -163,7 +163,7 @@ pub mod result {
         pub root: PathBuf,
         pub scan: ScanRules,
         pub policy: WorkspaceIndexPolicy,
-        pub default_model_ref: Option<String>,
+        pub default_embedding_model_ref: Option<String>,
         pub tables: Vec<WorkspaceIndexTable>,
         pub embedding_routes: BTreeMap<ContentKind, String>,
         pub fts: Option<WorkspaceIndexFts>,
@@ -242,14 +242,13 @@ impl result::WorkspaceIndexInfo {
             root: workspace.root.clone(),
             scan: workspace.scan.clone(),
             policy: (&workspace.index).into(),
-            default_model_ref: workspace
+            default_embedding_model_ref: workspace
                 .index
                 .descriptor()
-                .map(|index| index.default_model.model.reference()),
+                .map(|index| index.default_embedding_model().model().reference()),
             tables: workspace.index.descriptor().map_or_else(Vec::new, |index| {
                 index
-                    .tables()
-                    .expect("validated index descriptor")
+                    .content_indexes()
                     .iter()
                     .map(|table| result::WorkspaceIndexTable {
                         kind: table.kind,
@@ -262,15 +261,15 @@ impl result::WorkspaceIndexInfo {
                 .descriptor()
                 .map_or_else(Default::default, |index| {
                     index
-                        .routes
+                        .embedding_routes()
                         .iter()
-                        .map(|(kind, model)| (*kind, model.model.reference()))
+                        .map(|(kind, model)| (*kind, model.model().reference()))
                         .collect()
                 }),
             fts: workspace
                 .index
                 .descriptor()
-                .map(|index| (&index.fts).into()),
+                .map(|index| (&index.fts()).into()),
             index_version,
             created_epoch_ms: workspace.created_epoch_ms,
             updated_epoch_ms: workspace.updated_epoch_ms,
@@ -294,11 +293,11 @@ impl From<&crate::domain::FtsConfig> for result::WorkspaceIndexFts {
 impl From<&crate::domain::EmbeddingModelInfo> for result::WorkspaceIndexEmbedding {
     fn from(value: &crate::domain::EmbeddingModelInfo) -> Self {
         Self {
-            provider: value.model.provider().to_owned(),
-            model: value.model.name().to_owned(),
-            dimension: value.dimension,
-            content_kinds: value.model.content_kinds().to_vec(),
-            metric: match value.metric {
+            provider: value.model().provider().to_owned(),
+            model: value.model().name().to_owned(),
+            dimension: value.dimension(),
+            content_kinds: value.model().content_kinds().to_vec(),
+            metric: match value.metric() {
                 crate::domain::EmbeddingMetric::Cosine => "cosine",
                 crate::domain::EmbeddingMetric::DotProduct => "dot",
                 crate::domain::EmbeddingMetric::Euclidean => "euclidean",
@@ -319,7 +318,7 @@ mod tests {
             compatibility: IndexCompatibility::Compatible { version: 2 },
             index_policy: WorkspaceIndexPolicy::Enabled,
             home: "/workspace/.zvec-grep".into(),
-            index_path: "/workspace/.zvec-grep/storage".into(),
+            index_path: "/workspace/.zvec-grep/index".into(),
             source: InfoSource::Index,
             workspace_index: None,
             status: Some(IndexStats::default()),

@@ -320,22 +320,25 @@ mod tests {
 
     #[test]
     fn index_summary_displays_saved_scan_rules() {
-        let scan = ScanRules {
-            globs: vec![
+        let scan = zg_engine::api::index::options::ScanRulesUpdate {
+            globs: Some(vec![
                 "*.rs".into(),
                 zg_engine::api::index::options::GlobRule {
                     pattern: "!vendor/**".into(),
                     case_insensitive: true,
                 },
-            ],
-            hidden: true,
-            no_ignore: true,
-            ignore_files: vec!["custom.ignore".into()],
-            max_depth: Some(2),
-            max_file_size_bytes: Some(4096),
-            follow_symlinks: true,
-            nested_git: false,
-        };
+            ]),
+            include_hidden: Some(true),
+            use_default_ignores: Some(false),
+            ignore_files: Some(vec!["custom.ignore".into()]),
+            max_depth: Some(Some(2)),
+            max_file_size_bytes: Some(Some(4096)),
+            follow_symlinks: Some(true),
+            nested_git: Some(false),
+            ..Default::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("saved scan rules");
         let mut bytes = Vec::new();
         write_index_with_options(
             &mut bytes,

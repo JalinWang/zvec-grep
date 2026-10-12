@@ -18,11 +18,9 @@ use crate::{
         Content, ContentKind, Entity, EntityFragment, EntityId, FileFormat, FileIndexStatus,
         FileRecord, FileSnapshot, FragmentId, ImageContent, IndexDescriptor, IndexState, Range,
         SourcePath, Workspace,
-        model::{
-            EmbeddingMetric, EmbeddingModelInfo, EmbeddingRetrieval, EmbeddingSpace, ModelInfo,
-        },
+        model::{EmbeddingMetric, EmbeddingModelInfo, ModelInfo},
     },
-    models::ModelError,
+    models::{ModelError, QueryEncoding},
     storage::{
         IndexStore,
         types::{IndexedFragment, WorkspaceIndexStorageOptions},
@@ -31,7 +29,9 @@ use crate::{
 
 struct Runtime {
     info: EmbeddingModelInfo,
-    calls: Mutex<Vec<(ContentKind, ContentKind)>>,
+    calls: Mutex<Vec<(ContentKind, QueryEncoding)>>,
+    code_query: bool,
+    pinned: bool,
     fail: bool,
 }
 
@@ -43,26 +43,22 @@ impl Runtime {
             vec![ContentKind::Text, ContentKind::Code]
         };
         Self {
-            info: EmbeddingModelInfo {
-                model: ModelInfo::new("test", name, kinds).expect("model"),
-                space: EmbeddingSpace::fixture(),
-                retrieval: if multimodal {
-                    EmbeddingRetrieval::TextImage
-                } else {
-                    EmbeddingRetrieval::Text
-                },
+            info: EmbeddingModelInfo::new(
+                ModelInfo::new("test", name, kinds, 32).expect("model"),
                 dimension,
-                metric: EmbeddingMetric::Cosine,
-                max_batch_size: 32,
-                max_input_tokens: None,
-                max_image_bytes: None,
-            },
+                EmbeddingMetric::Cosine,
+                None,
+                None,
+            )
+            .expect("embedding model"),
             calls: Mutex::new(Vec::new()),
+            code_query: false,
+            pinned: true,
             fail: false,
         }
     }
 
-    fn calls(&self) -> Vec<(ContentKind, ContentKind)> {
+    fn calls(&self) -> Vec<(ContentKind, QueryEncoding)> {
         self.calls.lock().expect("calls").clone()
     }
 }
@@ -73,22 +69,40 @@ impl SearchEmbeddingRuntime for Runtime {
         &self.info
     }
 
+    fn query_encoding(
+        &self,
+        input: ContentKind,
+        target: ContentKind,
+    ) -> Result<QueryEncoding, ModelError> {
+        Ok(
+            if self.code_query && input != ContentKind::Image && target == ContentKind::Code {
+                QueryEncoding::TextPrefix("task: code retrieval | query: ")
+            } else {
+                QueryEncoding::Default
+            },
+        )
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        self.pinned
+    }
+
     async fn embed_queries(
         &self,
         queries: &[Content],
-        target: ContentKind,
+        encoding: QueryEncoding,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         self.calls
             .lock()
             .expect("calls")
-            .extend(queries.iter().map(|query| (query.kind(), target)));
+            .extend(queries.iter().map(|query| (query.kind(), encoding)));
         if self.fail {
             return Err(ModelError::internal("intentional inference failure"));
         }
         Ok(queries
             .iter()
             .map(|_| {
-                let mut vector = vec![0.0; self.info.dimension];
+                let mut vector = vec![0.0; self.info.dimension()];
                 vector[0] = 1.0;
                 vector
             })
@@ -105,14 +119,18 @@ struct Fixture {
 impl Fixture {
     fn new(default: &Runtime, routes: &[(ContentKind, &Runtime)]) -> Self {
         let directory = tempfile::tempdir().expect("index directory");
-        let mut descriptor = IndexDescriptor::single(default.info.clone());
-        descriptor.routes = routes
-            .iter()
-            .map(|(kind, model)| (*kind, model.info.clone()))
-            .collect();
+        let descriptor = IndexDescriptor::new(
+            default.info.clone(),
+            routes
+                .iter()
+                .map(|(kind, model)| (*kind, model.info.clone()))
+                .collect(),
+            crate::domain::FTS_CONFIG,
+        )
+        .expect("index descriptor");
         let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: directory.path().join("storage"),
-            tables: descriptor.tables().expect("tables"),
+            tables: descriptor.content_indexes(),
         })
         .expect("open index");
         let workspace = Workspace {
@@ -162,9 +180,8 @@ impl Fixture {
             .descriptor()
             .expect("descriptor")
             .model_for(kind)
-            .expect("route")
             .expect("enabled")
-            .dimension;
+            .dimension();
         let mut vector = vec![0.0; dimension];
         vector[0] = similarity;
         vector[1] = (1.0 - similarity * similarity).sqrt();
@@ -225,7 +242,6 @@ impl Fixture {
             self.directory.path(),
             &self.workspace,
             self.directory.path(),
-            "generation-test",
             &self.store,
             models,
             &options,
@@ -261,14 +277,17 @@ fn vector_options() -> ContextOptions {
 
 #[tokio::test]
 async fn shared_model_reuses_original_query_and_merges_only_compatible_scores() {
-    let model = Runtime::new("shared", 2, true);
+    let mut model = Runtime::new("shared", 2, true);
     let fixture = Fixture::new(&model, &[]);
     fixture.add_kinds();
     let result = fixture
         .search(&[&model], vector_options())
         .await
         .expect("default search");
-    assert_eq!(model.calls(), vec![(ContentKind::Text, ContentKind::Text)]);
+    assert_eq!(
+        model.calls(),
+        vec![(ContentKind::Text, QueryEncoding::Default)]
+    );
     let diagnostics = result.diagnostics.index.expect("diagnostics");
     assert_eq!(diagnostics.targets.len(), 3);
     assert_eq!(diagnostics.result_groups.len(), 1);
@@ -286,15 +305,6 @@ async fn shared_model_reuses_original_query_and_merges_only_compatible_scores() 
     );
     for (rank, item) in result.items.iter().enumerate() {
         assert_eq!(item.rank, rank + 1);
-        let reference = item.content_ref.as_ref().expect("snapshot reference");
-        assert_eq!(reference.generation, "generation-test");
-        let stored = fixture
-            .store
-            .read_entity(&EntityId::from_string(reference.entity_id.clone()))
-            .expect("read snapshot")
-            .expect("stored entity");
-        assert_eq!(stored.entity.content.kind(), item.preview.kind());
-        assert_eq!(stored.file.relative_path.to_path_buf(), item.relative_path);
     }
     for kind in [ContentKind::Code, ContentKind::Image] {
         let options = ContextOptions {
@@ -307,7 +317,10 @@ async fn shared_model_reuses_original_query_and_merges_only_compatible_scores() 
             .expect("explicit target");
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].preview.kind(), kind);
-        assert_eq!(model.calls().last(), Some(&(ContentKind::Text, kind)));
+        assert_eq!(
+            model.calls().last(),
+            Some(&(ContentKind::Text, QueryEncoding::Default))
+        );
     }
     let calls = model.calls().len();
     let result = fixture
@@ -328,16 +341,34 @@ async fn shared_model_reuses_original_query_and_merges_only_compatible_scores() 
     assert_eq!(model.calls().len(), calls + 1);
     assert_eq!(
         model.calls().last(),
-        Some(&(ContentKind::Image, ContentKind::Text))
+        Some(&(ContentKind::Image, QueryEncoding::Default))
+    );
+
+    model.pinned = false;
+    let calls = model.calls().len();
+    let result = fixture
+        .search(&[&model], vector_options())
+        .await
+        .expect("mutable remote model");
+    assert_eq!(model.calls().len(), calls + 1);
+    assert_eq!(
+        result
+            .diagnostics
+            .index
+            .expect("diagnostics")
+            .result_groups
+            .len(),
+        3,
+        "query reuse does not imply cross-table score comparability"
     );
 }
 
 #[tokio::test]
 async fn task_instructions_separate_query_encodings_and_full_text_keeps_kind_groups() {
     let mut model = Runtime::new("task-aware", 2, true);
-    model.info.space.code_query_instruction = Some("task: code retrieval | query: ".into());
     let fixture = Fixture::new(&model, &[]);
     fixture.add_kinds();
+    model.code_query = true;
     let result = fixture
         .search(&[&model], vector_options())
         .await
@@ -345,8 +376,11 @@ async fn task_instructions_separate_query_encodings_and_full_text_keeps_kind_gro
     assert_eq!(
         model.calls(),
         vec![
-            (ContentKind::Text, ContentKind::Text),
-            (ContentKind::Text, ContentKind::Code)
+            (ContentKind::Text, QueryEncoding::Default),
+            (
+                ContentKind::Text,
+                QueryEncoding::TextPrefix("task: code retrieval | query: ")
+            )
         ]
     );
     let groups = result.diagnostics.index.expect("diagnostics").result_groups;
@@ -368,6 +402,23 @@ async fn task_instructions_separate_query_encodings_and_full_text_keeps_kind_gro
     assert_eq!(groups[0].scoring, IndexScoring::Hybrid);
     assert_eq!(groups[1].scoring, IndexScoring::Hybrid);
     assert_eq!(groups[2].scoring, IndexScoring::Vector);
+
+    model.code_query = false;
+    let calls = model.calls().len();
+    let result = fixture
+        .search(&[&model], vector_options())
+        .await
+        .expect("query instruction changes do not require rebuilding");
+    assert_eq!(model.calls().len(), calls + 1);
+    assert_eq!(
+        result
+            .diagnostics
+            .index
+            .expect("diagnostics")
+            .result_groups
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -464,7 +515,7 @@ async fn image_query_skips_unsupported_default_paths_but_explicit_target_errors(
     assert!(text.calls().is_empty());
     assert_eq!(
         vision.calls(),
-        vec![(ContentKind::Image, ContentKind::Image)]
+        vec![(ContentKind::Image, QueryEncoding::Default)]
     );
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].preview.kind(), ContentKind::Image);
@@ -488,7 +539,11 @@ async fn image_query_skips_unsupported_default_paths_but_explicit_target_errors(
         )
         .await
         .expect_err("unsupported explicit path");
-    assert!(error.message().contains("does not support image to text"));
+    assert!(
+        error
+            .message()
+            .contains("does not support image query input for the text table")
+    );
 
     let text_only = Fixture::new(&text, &[]);
     let error = text_only

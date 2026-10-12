@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zg_engine::ErrorReport;
 use zg_engine::api::{
-    content::{ContentResult, ReadContentOptions},
     context::{ContextOptions, ContextResult},
     index::{IndexOptions, IndexResult, progress::IndexProgress},
     info::{InfoOptions, InfoResult},
@@ -77,7 +76,6 @@ pub struct ExecuteRequest {
 #[serde(rename_all = "snake_case", tag = "kind", content = "request")]
 pub enum DaemonCommand {
     Context(ContextOptions),
-    ReadContent(ReadContentOptions),
     Index(IndexOptions),
     IndexAuthorization(IndexOptions),
     QueryAuthorization(ContextOptions),
@@ -189,7 +187,6 @@ pub enum IndexStreamEvent {
 #[serde(rename_all = "snake_case", tag = "kind", content = "reply")]
 pub enum DaemonReply {
     Context(Box<ContextResult>),
-    Content(Box<ContentResult>),
     Index(Box<IndexResult>),
     IndexAuthorization(Vec<zg_engine::authorization::IndexAuthorization>),
     QueryAuthorization(Vec<zg_engine::authorization::QueryAuthorization>),
@@ -295,7 +292,7 @@ mod tests {
             compatibility: IndexCompatibility::Compatible { version: 2 },
             index_policy: WorkspaceIndexPolicy::Enabled,
             home: "/workspace/.zvec-grep".into(),
-            index_path: "/workspace/.zvec-grep/storage".into(),
+            index_path: "/workspace/.zvec-grep/index".into(),
             source: InfoSource::Index,
             workspace_index: Some(WorkspaceIndexInfo {
                 name: "search-engine".to_owned(),
@@ -303,7 +300,7 @@ mod tests {
                 root: "/workspace".into(),
                 scan: ScanRules::default(),
                 policy: WorkspaceIndexPolicy::Enabled,
-                default_model_ref: None,
+                default_embedding_model_ref: None,
                 tables: Vec::new(),
                 embedding_routes: std::collections::BTreeMap::new(),
                 fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
@@ -398,11 +395,8 @@ mod tests {
         assert_eq!(decoded, result);
     }
     #[test]
-    fn image_query_and_content_reference_roundtrip_without_losing_bytes() {
-        use zg_engine::api::{
-            content::{ContentRef, ReadContentOptions},
-            context::options::{FileFormat, QueryImage},
-        };
+    fn image_query_roundtrips_without_losing_bytes() {
+        use zg_engine::api::context::options::{FileFormat, QueryImage};
         let image = DaemonCommand::Context(ContextOptions {
             target_kind: Some(zg_engine::api::context::options::ContentKind::Image),
             query_image: Some(QueryImage::Bytes {
@@ -417,20 +411,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<DaemonCommand>(value).expect("image decode"),
             image
-        );
-        let read = DaemonCommand::ReadContent(ReadContentOptions {
-            root: Some("/workspace".into()),
-            ..ReadContentOptions::new(ContentRef {
-                generation: "generation".into(),
-                entity_id: "entity".into(),
-            })
-        });
-        assert_eq!(
-            serde_json::from_value::<DaemonCommand>(
-                serde_json::to_value(&read).expect("reference")
-            )
-            .expect("reference decode"),
-            read
         );
     }
 }

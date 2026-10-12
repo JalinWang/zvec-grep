@@ -219,7 +219,7 @@ pub fn query_authorizations(
             let query = crate::api::index::IndexOptions {
                 endpoint: options.endpoint.clone(),
                 embedding: Some(crate::api::index::options::EmbeddingModelSpec {
-                    reference: schema.model.reference(),
+                    reference: schema.model().reference(),
                     revision: None,
                     cache_dir: None,
                     endpoint: None,
@@ -278,6 +278,7 @@ struct Grant {
 #[derive(Serialize, Deserialize)]
 struct SignedGrant {
     grant: Grant,
+    key_id: String,
     signature: Vec<u8>,
 }
 
@@ -450,7 +451,7 @@ pub fn grant(
             manifest
                 .as_ref()
                 .and_then(|m| m.default_embedding())
-                .map(|e| e.model.reference())
+                .map(|e| e.model().reference())
         })
         .or_else(|| {
             env::var("ZVEC_GREP_EMBEDDING")
@@ -518,7 +519,11 @@ fn persist_grant(grant: Grant) -> Result<(), EngineError> {
         .map(|grant| {
             let signature =
                 hmac_sha256::HMAC::mac(serde_json::to_vec(&grant).map_err(json)?, &key).to_vec();
-            Ok(SignedGrant { grant, signature })
+            Ok(SignedGrant {
+                grant,
+                key_id: crate::utils::sha256_hex(&key),
+                signature,
+            })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
     let bytes = if signed.len() == 1 {
@@ -548,12 +553,28 @@ fn read_grants(root: &Path) -> Result<Vec<Grant>, EngineError> {
         SignedGrants::One(record) => vec![record],
         SignedGrants::Many(records) => records,
     };
+    // Credentials travel with the workspace; consent belongs to this machine.
+    let Ok(path) = key_path() else {
+        return Ok(Vec::new());
+    };
+    let key = match fs::read(&path) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io(error)),
+    };
+    if key.len() < 32 {
+        return Err(EngineError::invalid_argument(
+            "Authorization signing key must contain at least 32 bytes",
+        ));
+    }
+    let key_id = crate::utils::sha256_hex(&key);
     records
         .into_iter()
+        .filter(|signed| signed.key_id == key_id && signed.grant.root == root)
         .map(|signed| {
             let expected = hmac_sha256::HMAC::mac(
                 serde_json::to_vec(&signed.grant).map_err(json)?,
-                signing_key(false)?,
+                &key,
             );
             let valid = signed.signature.len() == expected.len()
                 && signed
@@ -1123,7 +1144,7 @@ mod tests {
             api::context::{ContextOptions, options::RefreshPolicy},
             domain::{
                 IndexDescriptor, IndexState, Workspace,
-                model::{EmbeddingMetric, EmbeddingModelInfo, ModelConfig},
+                model::{EmbeddingMetric, EmbeddingModelInfo},
             },
             workspace::{build::prepare_build, manifest::write_workspace_manifest},
         };
@@ -1134,24 +1155,30 @@ mod tests {
                 name: "workspace".to_owned(),
                 root: directory.path().to_path_buf(),
                 scan: crate::domain::ScanRules::default(),
-                index: IndexState::Enabled(Box::new(IndexDescriptor::single(EmbeddingModelInfo {
-                    space: crate::domain::model::EmbeddingSpace::fixture(),
-                    retrieval: crate::domain::model::EmbeddingRetrieval::TextImage,
-                    model: crate::domain::model::ModelInfo::new(
-                        "qwen",
-                        "text-embedding-v4",
-                        [
-                            crate::domain::ContentKind::Text,
-                            crate::domain::ContentKind::Code,
-                        ],
+                index: IndexState::Enabled(Box::new(
+                    IndexDescriptor::new(
+                        EmbeddingModelInfo::new(
+                            crate::domain::model::ModelInfo::new(
+                                "qwen",
+                                "text-embedding-v4",
+                                [
+                                    crate::domain::ContentKind::Text,
+                                    crate::domain::ContentKind::Code,
+                                ],
+                                32,
+                            )
+                            .expect("fixture model identity"),
+                            1024,
+                            EmbeddingMetric::Cosine,
+                            None,
+                            None,
+                        )
+                        .expect("embedding model"),
+                        std::collections::BTreeMap::new(),
+                        crate::domain::FTS_CONFIG,
                     )
-                    .expect("fixture model identity"),
-                    dimension: 1024,
-                    metric: EmbeddingMetric::Cosine,
-                    max_batch_size: 32,
-                    max_input_tokens: None,
-                    max_image_bytes: None,
-                }))),
+                    .expect("index descriptor"),
+                )),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 1,
             },
@@ -1159,15 +1186,15 @@ mod tests {
             Some(crate::workspace::CURRENT_INDEX_VERSION),
             std::collections::BTreeMap::from([(
                 "qwen/text-embedding-v4".into(),
-                ModelConfig {
+                crate::workspace::credentials::StoredModelConfig {
                     endpoint: Some("https://active.test/embeddings".into()),
-                    ..ModelConfig::default()
+                    ..crate::workspace::credentials::StoredModelConfig::default()
                 },
             )]),
         )
         .expect("manifest");
         active.storage_generation = Some(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(active.storage_home()).expect("active generation");
+        fs::create_dir_all(active.index_path()).expect("active generation");
         write_workspace_manifest(&home, &active).expect("write active");
         let mut target = active.clone();
         target

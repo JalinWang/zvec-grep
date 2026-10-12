@@ -78,13 +78,12 @@ mod tests {
                 crate::models::runtime::ModelComputeRuntime::shared(),
             )
             .expect("catalog backend should construct without loading model assets");
-            model.info().validate().expect("valid catalog model info");
-            assert_eq!(model.info().model.reference(), entry.reference());
+            assert_eq!(model.info().model().reference(), entry.reference());
             assert_eq!(
-                model.info().model,
-                entry.model_info().expect("catalog model info")
+                model.info().model(),
+                &entry.model_info().expect("catalog model info")
             );
-            assert_eq!(model.info().dimension, entry.dimension());
+            assert_eq!(model.info().dimension(), entry.dimension());
         }
 
         let unknown = create_embedding_model(

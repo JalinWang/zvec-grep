@@ -15,7 +15,7 @@ pub mod options {
     #[serde(deny_unknown_fields)]
     #[allow(clippy::struct_excessive_bools)]
     pub struct IndexOptions {
-        /// Unique workspace name. Defaults to the root directory name on creation;
+        /// Workspace label. Defaults to the root directory name on creation;
         /// supplying a different name explicitly renames an existing workspace.
         #[serde(default)]
         pub name: Option<String>,
@@ -51,6 +51,7 @@ pub mod options {
         /// Separate from the explicit blanket `allow_remote` option.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub authorized_remote: Vec<crate::authorization::IndexAuthorization>,
+        /// Explicit default-model credential, saved encrypted after successful indexing.
         #[serde(default)]
         pub api_key: Option<String>,
         #[serde(default)]
@@ -92,9 +93,9 @@ pub mod options {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub insensitive_globs: Option<Vec<GlobRule>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub hidden: Option<bool>,
+        pub include_hidden: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub no_ignore: Option<bool>,
+        pub use_default_ignores: Option<bool>,
         /// Whether indexing may descend into nested Git repositories and submodules.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub nested_git: Option<bool>,
@@ -115,51 +116,48 @@ pub mod options {
     }
 
     impl ScanRulesUpdate {
-        /// Applies only the fields supplied by this request.
-        pub fn apply(&self, target: &mut ScanRules) {
-            if let Some(rules) = &self.globs {
-                target.globs.clone_from(rules);
-            }
+        /// Returns new rules with only the supplied fields changed.
+        ///
+        /// # Errors
+        /// Returns an error if the resulting maximum file size is zero.
+        pub fn apply(&self, current: &ScanRules) -> crate::EngineResult<ScanRules> {
+            let mut globs = self
+                .globs
+                .clone()
+                .unwrap_or_else(|| current.globs().to_vec());
             if self.sensitive_globs.is_some() || self.insensitive_globs.is_some() {
                 let mut rules = self.sensitive_globs.clone().unwrap_or_else(|| {
-                    target
-                        .globs
+                    globs
                         .iter()
                         .filter(|rule| !rule.case_insensitive)
                         .cloned()
                         .collect()
                 });
                 rules.extend(self.insensitive_globs.clone().unwrap_or_else(|| {
-                    target
-                        .globs
+                    globs
                         .iter()
                         .filter(|rule| rule.case_insensitive)
                         .cloned()
                         .collect()
                 }));
-                target.globs = rules;
+                globs = rules;
             }
-            if let Some(value) = self.hidden {
-                target.hidden = value;
-            }
-            if let Some(value) = self.no_ignore {
-                target.no_ignore = value;
-            }
-            if let Some(value) = self.nested_git {
-                target.nested_git = value;
-            }
-            if let Some(value) = &self.ignore_files {
-                target.ignore_files.clone_from(value);
-            }
-            if let Some(value) = self.max_depth {
-                target.max_depth = value;
-            }
-            if let Some(value) = self.max_file_size_bytes {
-                target.max_file_size_bytes = value;
-            }
-            if let Some(value) = self.follow_symlinks {
-                target.follow_symlinks = value;
-            }
+            ScanRules::new(
+                globs,
+                self.include_hidden
+                    .unwrap_or_else(|| current.include_hidden()),
+                self.follow_symlinks
+                    .unwrap_or_else(|| current.follow_symlinks()),
+                self.max_depth.unwrap_or_else(|| current.max_depth()),
+                self.max_file_size_bytes
+                    .unwrap_or_else(|| current.max_file_size_bytes()),
+                self.use_default_ignores
+                    .unwrap_or_else(|| current.use_default_ignores()),
+                self.ignore_files
+                    .clone()
+                    .unwrap_or_else(|| current.ignore_files().to_vec()),
+                self.nested_git.unwrap_or_else(|| current.nested_git()),
+            )
         }
     }
 
@@ -206,49 +204,62 @@ pub mod options {
 
         #[test]
         fn complete_glob_updates_replace_old_rules_and_preserve_order() {
-            let mut scan = ScanRules {
-                globs: vec![GlobRule {
+            let scan = ScanRulesUpdate {
+                globs: Some(vec![GlobRule {
                     pattern: "!secret/**".to_owned(),
                     case_insensitive: true,
-                }],
+                }]),
                 ..Default::default()
-            };
+            }
+            .apply(&ScanRules::default())
+            .expect("initial rules");
             let replacement = vec![GlobRule::from("secret/**")];
-            ScanRulesUpdate {
+            let scan = ScanRulesUpdate {
                 globs: Some(replacement.clone()),
                 ..Default::default()
             }
-            .apply(&mut scan);
-            assert_eq!(scan.globs, replacement);
-            ScanRulesUpdate {
+            .apply(&scan)
+            .expect("replacement rules");
+            assert_eq!(scan.globs(), replacement);
+            let scan = ScanRulesUpdate {
                 globs: Some(Vec::new()),
                 ..Default::default()
             }
-            .apply(&mut scan);
-            assert!(scan.globs.is_empty());
+            .apply(&scan)
+            .expect("clear rules");
+            assert!(scan.globs().is_empty());
         }
 
         #[test]
         fn updates_preserve_omission_and_apply_false_empty_and_null() {
-            let mut scan = ScanRules {
-                globs: vec!["*.rs".into()],
-                hidden: true,
-                nested_git: true,
-                max_depth: Some(3),
+            let defaults: ScanRules = serde_json::from_str("{}").expect("default rules");
+            assert_eq!(defaults, ScanRules::default());
+            let initial = ScanRulesUpdate {
+                globs: Some(vec!["*.rs".into()]),
+                include_hidden: Some(true),
+                max_depth: Some(Some(3)),
                 ..Default::default()
-            };
-            let update: ScanRulesUpdate =
-                serde_json::from_str(r#"{"hidden":false,"nested_git":false,"max_depth":null}"#)
-                    .expect("valid test fixture");
+            }
+            .apply(&defaults)
+            .expect("initial rules");
+            let update: ScanRulesUpdate = serde_json::from_str(
+                r#"{"include_hidden":false,"nested_git":false,"use_default_ignores":false,"max_depth":null}"#,
+            ).expect("valid test fixture");
             assert_eq!(update.max_depth, Some(None));
             assert_eq!(update.follow_symlinks, None);
-            update.apply(&mut scan);
-            assert!(!scan.hidden);
-            assert!(!scan.nested_git);
-            assert_eq!(scan.max_depth, None);
-            ScanRulesUpdate::default().apply(&mut scan);
-            assert!(!scan.nested_git, "omission preserves the configured value");
-            assert_eq!(scan.globs, vec![GlobRule::from("*.rs")]);
+            let scan = update.apply(&initial).expect("updated rules");
+            assert!(!scan.include_hidden());
+            assert!(!scan.nested_git());
+            assert!(!scan.use_default_ignores());
+            assert_eq!(scan.max_depth(), None);
+            assert!(initial.include_hidden());
+            assert!(initial.use_default_ignores());
+            assert_eq!(initial.max_depth(), Some(3));
+            let unchanged = ScanRulesUpdate::default()
+                .apply(&scan)
+                .expect("unchanged rules");
+            assert_eq!(unchanged, scan, "omission preserves configured values");
+            assert_eq!(scan.globs(), [GlobRule::from("*.rs")]);
             assert_eq!(
                 serde_json::to_value(&update).expect("valid test fixture")["max_depth"],
                 serde_json::Value::Null
@@ -259,10 +270,20 @@ pub mod options {
                     .get("max_depth")
                     .is_none()
             );
+            let invalid = ScanRulesUpdate {
+                globs: Some(Vec::new()),
+                max_file_size_bytes: Some(Some(0)),
+                ..Default::default()
+            };
+            assert!(invalid.apply(&scan).is_err());
+            assert_eq!(
+                scan, unchanged,
+                "failed updates preserve the original rules"
+            );
             let update: ScanRulesUpdate =
                 serde_json::from_str(r#"{"globs":[]}"#).expect("valid test fixture");
-            update.apply(&mut scan);
-            assert!(scan.globs.is_empty());
+            let scan = update.apply(&scan).expect("clear rules");
+            assert!(scan.globs().is_empty());
         }
 
         #[test]

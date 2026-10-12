@@ -129,22 +129,13 @@ impl LlamaCppEmbeddingModel {
             .unwrap_or_else(default_model_cache_dir);
         Ok(Self {
             entry,
-            info: EmbeddingModelInfo {
-                space: EmbeddingCatalogEntry::LlamaCpp(entry).embedding_space(None),
-                retrieval: EmbeddingCatalogEntry::LlamaCpp(entry).retrieval(),
-                model: EmbeddingCatalogEntry::LlamaCpp(entry)
-                    .model_info()
-                    .map_err(|error| {
-                        ModelError::internal("invalid catalog model info")
-                            .with_cause(error)
-                            .shared()
-                    })?,
-                dimension: entry.dimension,
-                metric: entry.metric,
-                max_batch_size: entry.max_batch_size,
-                max_input_tokens: Some(entry.context_size),
-                max_image_bytes: None,
-            },
+            info: EmbeddingCatalogEntry::LlamaCpp(entry)
+                .embedding_model_info()
+                .map_err(|error| {
+                    ModelError::internal("invalid catalog model info")
+                        .with_cause(error)
+                        .shared()
+                })?,
             model_cache_dir,
             device: options.device,
             compute_runtime,
@@ -253,6 +244,10 @@ impl LlamaCppEmbeddingModel {
 
 #[async_trait]
 impl EmbeddingModel for LlamaCppEmbeddingModel {
+    fn has_pinned_weights(&self) -> bool {
+        true
+    }
+
     fn info(&self) -> &EmbeddingModelInfo {
         &self.info
     }

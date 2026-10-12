@@ -147,7 +147,7 @@ fn prefixes_and_catalog_info_match_main() {
         crate::models::runtime::ModelComputeRuntime::shared(),
     )
     .expect("fixture model");
-    assert_eq!(model.info().max_input_tokens, Some(2));
+    assert_eq!(model.info().max_input_tokens(), Some(2));
     assert_eq!(onnx_artifact("q4").expect("q4"), "onnx/model_q4.onnx");
     assert_eq!(
         onnx_artifact("q8").expect("q8"),

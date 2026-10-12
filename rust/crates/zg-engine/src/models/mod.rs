@@ -19,6 +19,7 @@ pub(crate) use error::ModelError;
 pub(crate) use runtime::{ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest};
 pub(crate) use spi::{
     EmbeddingConcurrencyDefaults, EmbeddingOptions, EmbeddingPrepareOptions, ModelProgressReporter,
+    QueryEncoding,
 };
 
 #[cfg(test)]

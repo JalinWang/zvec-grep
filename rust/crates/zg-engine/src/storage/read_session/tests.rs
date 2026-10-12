@@ -1,4 +1,4 @@
-use std::{fs, sync::Barrier};
+use std::{collections::BTreeMap, fs, sync::Barrier};
 
 use crate::{
     api::context::{
@@ -34,9 +34,7 @@ impl Fixture {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path().canonicalize().expect("canonical root");
         let home = root.join(".zvec-grep");
-        let storage_home = home
-            .join("generations")
-            .join(uuid::Uuid::new_v4().to_string());
+        let storage_home = home.join("index");
         fs::create_dir_all(&storage_home).expect("generation");
         let fixture = Self {
             _directory: directory,
@@ -63,22 +61,19 @@ impl Fixture {
                 name: "cache-fixture".into(),
                 root: root.to_path_buf(),
                 scan: crate::domain::ScanRules::default(),
-                index: IndexState::Enabled(Box::new(IndexDescriptor::single(schema()))),
+                index: IndexState::Enabled(Box::new(
+                    IndexDescriptor::new(schema(), BTreeMap::new(), crate::domain::FTS_CONFIG)
+                        .expect("index descriptor"),
+                )),
                 created_epoch_ms: 1,
                 updated_epoch_ms: 1,
             },
             self.home.clone(),
             Some(CURRENT_INDEX_VERSION),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
         )
         .expect("manifest");
-        manifest.storage_generation = Some(
-            self.storage_home
-                .file_name()
-                .expect("generation")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        manifest.storage_generation = Some(uuid::Uuid::new_v4().to_string());
         write_workspace_manifest(&self.home, &manifest).expect("publish manifest");
         let options = ContextOptions {
             root: Some(root.to_path_buf()),
@@ -94,24 +89,23 @@ impl Fixture {
 }
 
 fn schema() -> EmbeddingModelInfo {
-    EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: ModelInfo::new(
+    EmbeddingModelInfo::new(
+        ModelInfo::new(
             "fixture",
             "read-cache",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    }
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("embedding metadata")
 }
 
 fn write_text(home: &Path, storage_home: &Path, text: &str) {
@@ -119,9 +113,9 @@ fn write_text(home: &Path, storage_home: &Path, text: &str) {
         acquire_home_lock(home, LockMode::Write, "test.write").expect("writer drains cache");
     let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
         storage_path: storage_home.to_path_buf(),
-        tables: IndexDescriptor::single(schema())
-            .tables()
-            .expect("effective tables"),
+        tables: IndexDescriptor::new(schema(), BTreeMap::new(), crate::domain::FTS_CONFIG)
+            .expect("index descriptor")
+            .content_indexes(),
     })
     .expect("writable storage");
     let relative_path = SourcePath::new("source.txt").expect("source path");
@@ -300,7 +294,7 @@ fn generation_replacement_and_shutdown_preserve_inflight_readers() {
     let fixture = Fixture::new();
     let replacement = fixture
         .home
-        .join("generations")
+        .join("temp")
         .join(uuid::Uuid::new_v4().to_string());
     fs::create_dir_all(&replacement).expect("replacement generation");
     write_text(&fixture.home, &replacement, "vineyard");
@@ -373,12 +367,57 @@ fn writes_invalidate_every_local_cache_and_next_query_sees_changes() {
 }
 
 #[test]
+fn rebuild_at_the_same_path_retires_cached_handles_and_opens_new_storage() {
+    use crate::workspace::build::{prepare_build, publish_build};
+    let fixture = Fixture::new();
+    let (manifest, _) = fixture.publish();
+    let cache = cache();
+    let (reader, lease) = fixture.read(&cache);
+    let previous = Arc::downgrade(&lease.session);
+    assert!(acquire_home_lock(&fixture.home, LockMode::Write, "test.rebuild").is_err());
+    drop(lease);
+    drop(reader);
+    let build = {
+        let _writer = acquire_home_lock(&fixture.home, LockMode::Write, "test.rebuild")
+            .expect("drain cached storage");
+        assert_eq!(previous.strong_count(), 0);
+        prepare_build(manifest.clone()).expect("new build")
+    };
+    assert_ne!(build.target.storage_generation, manifest.storage_generation);
+    write_text(&fixture.home, &build.index_path(), "vineyard");
+    {
+        let _writer = acquire_home_lock(&fixture.home, LockMode::Write, "test.publish")
+            .expect("publication lock");
+        publish_build(build, 2).expect("replace index directory");
+    }
+    let (_reader, lease) = fixture.read(&cache);
+    assert!(!Weak::ptr_eq(&previous, &Arc::downgrade(&lease.session)));
+    assert!(
+        lease
+            .storage()
+            .search_fts(ContentKind::Text, "orchard", 10, None)
+            .expect("old query")
+            .is_empty()
+    );
+    assert_eq!(
+        lease
+            .storage()
+            .search_fts(ContentKind::Text, "vineyard", 10, None)
+            .expect("new query")
+            .len(),
+        1
+    );
+    assert_eq!(fixture.storage_home, fixture.home.join("index"));
+    assert!(!fixture.home.join("temp").exists());
+}
+
+#[test]
 fn failed_open_can_be_retried_without_leaking_a_residency_lock() {
     let fixture = Fixture::new();
     let cache = cache();
     let missing = fixture
         .home
-        .join("generations")
+        .join("temp")
         .join(uuid::Uuid::new_v4().to_string());
     let reader = acquire_home_lock(&fixture.home, LockMode::Read, "test.query").expect("reader");
     assert!(cache.acquire(&fixture.home, &missing).is_err());

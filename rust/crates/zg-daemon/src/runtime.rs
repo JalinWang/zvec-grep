@@ -310,18 +310,6 @@ async fn execute_command(
                     .map(|reply| DaemonReply::Context(Box::new(reply))),
             )
         }
-        DaemonCommand::ReadContent(mut request) => {
-            let signal = state.shutdown.child_token();
-            let _guard = signal.clone().drop_guard();
-            request.signal = Some(signal);
-            engine_execution(
-                state
-                    .engine
-                    .read_content(request)
-                    .await
-                    .map(|reply| DaemonReply::Content(Box::new(reply))),
-            )
-        }
         DaemonCommand::Index(request) => match state.runtimes.submit_index(request, true).await {
             Ok(submitted) if submitted.job.state == JobState::Succeeded => {
                 submitted.result.map_or_else(

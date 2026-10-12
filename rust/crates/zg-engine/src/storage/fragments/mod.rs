@@ -25,8 +25,8 @@ use super::{
 use crate::{
     EngineError, EngineResult,
     domain::{
-        CodeMetadata, ContentKind, DirectoryId, Entity, EntityFragment, EntityId, EntityMetadata,
-        FTS_CONFIG, FileId, FileRecord, FragmentId, IndexField, IndexTable, SourcePath,
+        CodeMetadata, ContentIndex, ContentKind, DirectoryId, Entity, EntityFragment, EntityId,
+        EntityMetadata, FTS_CONFIG, FileId, FileRecord, FragmentId, IndexField, SourcePath,
         model::EmbeddingMetric,
     },
     utils::sha256_hex_parts,
@@ -39,11 +39,15 @@ pub(super) struct Fragments {
 }
 
 impl Fragments {
-    pub(super) fn open(root: &Path, tables: &[IndexTable], read_only: bool) -> EngineResult<Self> {
+    pub(super) fn open(
+        root: &Path,
+        tables: &[ContentIndex],
+        read_only: bool,
+    ) -> EngineResult<Self> {
         let mut indexes = BTreeMap::new();
         for table in tables {
             let embedding = &table.embedding;
-            let dimension = u32::try_from(embedding.dimension)
+            let dimension = u32::try_from(embedding.dimension())
                 .ok()
                 .filter(|value| (1..=20_000).contains(value))
                 .ok_or_else(|| {
@@ -51,7 +55,7 @@ impl Fragments {
                         "storage embedding dimension must be between 1 and 20,000",
                     )
                 })?;
-            let metric = match embedding.metric {
+            let metric = match embedding.metric() {
                 EmbeddingMetric::Cosine => MetricType::Cosine,
                 EmbeddingMetric::DotProduct => MetricType::Ip,
                 EmbeddingMetric::Euclidean => MetricType::L2,

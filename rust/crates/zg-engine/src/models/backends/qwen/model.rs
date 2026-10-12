@@ -63,36 +63,31 @@ impl QwenEmbeddingModel {
             )
             .shared());
         }
-        let valid_endpoint = reqwest::Url::parse(&endpoint).is_ok_and(|url| {
-            matches!(url.scheme(), "http" | "https")
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-        });
-        if !valid_endpoint {
-            return Err(ModelError::invalid_argument(
-                "embedding endpoint must be an HTTP(S) URL without user information, query parameters or fragment; pass credentials through api_key",
-            ).shared());
-        }
+        let endpoint = reqwest::Url::parse(&endpoint)
+            .ok()
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
+            .map(|url| url.to_string())
+            .ok_or_else(|| {
+                ModelError::invalid_argument(
+                    "embedding endpoint must be an HTTP(S) URL without user information, query parameters or fragment; pass credentials through api_key",
+                ).shared()
+            })?;
         Ok(Self {
             entry,
-            info: EmbeddingModelInfo {
-                space: EmbeddingCatalogEntry::Qwen(entry).embedding_space(Some(&endpoint)),
-                retrieval: EmbeddingCatalogEntry::Qwen(entry).retrieval(),
-                model: EmbeddingCatalogEntry::Qwen(entry)
-                    .model_info()
-                    .map_err(|error| {
-                        ModelError::internal("invalid catalog model info")
-                            .with_cause(error)
-                            .shared()
-                    })?,
-                dimension: entry.dimension,
-                metric: entry.metric,
-                max_batch_size: entry.max_batch_size,
-                max_input_tokens: Some(entry.max_input_tokens),
-                max_image_bytes: entry.max_image_bytes,
-            },
+            info: EmbeddingCatalogEntry::Qwen(entry)
+                .embedding_model_info()
+                .map_err(|error| {
+                    ModelError::internal("invalid catalog model info")
+                        .with_cause(error)
+                        .shared()
+                })?,
             api_key,
             endpoint,
             http,
@@ -112,7 +107,7 @@ impl QwenEmbeddingModel {
         let request = json!({
             "model": self.entry.model,
             "input": texts,
-            "dimensions": self.info.dimension,
+            "dimensions": self.info.dimension(),
             "encoding_format": "float",
         });
         let response = self.send(request, signal, trace_headers).await?;
@@ -184,7 +179,7 @@ impl QwenEmbeddingModel {
         let request = json!({
             "model": self.entry.model,
             "input": { "contents": request_contents },
-            "parameters": { "dimension": self.info.dimension, "enable_fusion": true },
+            "parameters": { "dimension": self.info.dimension(), "enable_fusion": true },
         });
         let response = self.send(request, signal, trace_headers).await?;
         let body = parse_response_body(&response, self.entry)?;

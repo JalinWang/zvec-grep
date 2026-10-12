@@ -4,6 +4,10 @@ Rule ranking scores the entire recalled entity pool before applying the result
 limit. It runs in the shared indexed-search engine, so direct, server, and MCP
 queries use the same policy.
 
+The policy applies to text/code plans with full-text recall or explicit symbol
+preference. Pure vector plans without symbol preference and image results keep
+their existing score and ordering semantics.
+
 The policy normalizes RRF by the maximum possible score for the enabled routes,
 adds bounded symbol/definition bonuses, and applies the minimum applicable path
 factor. Name evidence comes from entity metadata, not arbitrary mentions in

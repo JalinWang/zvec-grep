@@ -18,6 +18,8 @@ vulkan = ["llama-cpp-2/vulkan", "ort/webgpu"]
 [dependencies]
 async-trait.workspace = true
 base64 = "0.23.1"
+chacha20poly1305 = { version = "0.10.1", features = ["std"] }
+getrandom = "0.4.3"
 encoding_rs = "0.8.35"
 futures-util = "0.3.34"
 globset.workspace = true

@@ -20,31 +20,30 @@ fn file(id: u32, path: impl Into<PathBuf>) -> FileRecord {
 }
 
 fn model() -> EmbeddingModelInfo {
-    EmbeddingModelInfo {
-        space: crate::domain::model::EmbeddingSpace::fixture(),
-        retrieval: crate::domain::model::EmbeddingRetrieval::Text,
-        model: crate::domain::model::ModelInfo::new(
+    EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
             "fixture",
             "fixture",
             [
                 crate::domain::ContentKind::Text,
                 crate::domain::ContentKind::Code,
             ],
+            32,
         )
         .expect("fixture model identity"),
-        dimension: 3,
-        metric: EmbeddingMetric::Cosine,
-        max_batch_size: 32,
-        max_input_tokens: None,
-        max_image_bytes: None,
-    }
+        3,
+        EmbeddingMetric::Cosine,
+        None,
+        None,
+    )
+    .expect("embedding metadata")
 }
 
 fn metadata_store(path: &Path) -> Fragments {
     super::super::zvec::initialize().expect("initialize zvec");
     Fragments::open(
         path,
-        &[IndexTable {
+        &[ContentIndex {
             kind: ContentKind::Text,
             embedding: model(),
         }],
@@ -489,7 +488,7 @@ fn assert_filter_file_ids(store: &Fragments, path: &StoragePathFilter, expected:
 fn reopen_filter_store(path: &Path) -> Fragments {
     Fragments::open(
         path,
-        &[IndexTable {
+        &[ContentIndex {
             kind: ContentKind::Text,
             embedding: model(),
         }],
@@ -628,21 +627,29 @@ fn projection_validation_keeps_one_model_and_one_row_per_fragment() {
 fn fragment_ownership_is_checked_across_model_collections() {
     super::super::zvec::initialize().expect("initialize zvec");
     let home = tempfile::tempdir().expect("storage");
-    let mut other = model();
-    other.model = crate::domain::model::ModelInfo::new(
-        other.model.provider(),
-        "other",
-        other.model.content_kinds().iter().copied(),
+    let base = model();
+    let other = EmbeddingModelInfo::new(
+        crate::domain::model::ModelInfo::new(
+            base.model().provider(),
+            "other",
+            base.model().content_kinds().iter().copied(),
+            base.model().max_batch_size(),
+        )
+        .expect("fixture model identity"),
+        base.dimension(),
+        base.metric(),
+        base.max_input_tokens(),
+        base.max_image_bytes(),
     )
-    .expect("fixture model identity");
+    .expect("embedding metadata");
     let store = Fragments::open(
         home.path(),
         &[
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Text,
                 embedding: model(),
             },
-            IndexTable {
+            ContentIndex {
                 kind: ContentKind::Code,
                 embedding: other,
             },

@@ -6,7 +6,10 @@ use std::{
 use zg_host_native::{NativeScanner, PathPolicy, ScanRequest, TaskControl, WorkspaceScannerPort};
 
 use super::{GlobMatcher, ScanPolicy};
-use crate::domain::{GlobRule, ScanRules};
+use crate::{
+    api::index::options::ScanRulesUpdate,
+    domain::{GlobRule, ScanRules},
+};
 
 fn make_policy(
     root: &Path,
@@ -15,10 +18,11 @@ fn make_policy(
 ) -> crate::EngineResult<ScanPolicy> {
     ScanPolicy::new(
         root,
-        &ScanRules {
-            globs: globs.to_vec(),
-            ..options.clone()
-        },
+        &ScanRulesUpdate {
+            globs: Some(globs.to_vec()),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(options)?,
     )
 }
 
@@ -40,10 +44,12 @@ async fn scan(
                 roots: vec![
                     ScanPolicy::root_spec(
                         root,
-                        &ScanRules {
-                            globs: globs.to_vec(),
-                            ..options.clone()
-                        },
+                        &ScanRulesUpdate {
+                            globs: Some(globs.to_vec()),
+                            ..ScanRulesUpdate::default()
+                        }
+                        .apply(options)
+                        .expect("scan rules"),
                     )
                     .expect("policy"),
                 ],
@@ -76,10 +82,12 @@ async fn scan_and_query_use_identical_ordered_path_rules() {
     for path in paths {
         write(root, path, "example");
     }
-    let options = ScanRules {
-        no_ignore: true,
-        ..ScanRules::default()
-    };
+    let options = ScanRulesUpdate {
+        use_default_ignores: Some(false),
+        ..ScanRulesUpdate::default()
+    }
+    .apply(&ScanRules::default())
+    .expect("scan rules");
     let cases = [
         vec!["*.rs".into()],
         vec!["!blocked".into(), "blocked/keep.rs".into()],
@@ -123,16 +131,18 @@ async fn nested_repositories_are_selected_and_metadata_is_never_scanned() {
     write(root, "nested/code.rs", "fn main() {}");
     write(root, "nested/.zvec-grep/state.rs", "index metadata");
     let globs = vec!["nested/**".into()];
-    for no_ignore in [false, true] {
+    for use_default_ignores in [false, true] {
         assert_eq!(
             scan(
                 root,
                 &globs,
-                &ScanRules {
-                    no_ignore,
-                    hidden: true,
-                    ..ScanRules::default()
-                },
+                &ScanRulesUpdate {
+                    use_default_ignores: Some(use_default_ignores),
+                    include_hidden: Some(true),
+                    ..ScanRulesUpdate::default()
+                }
+                .apply(&ScanRules::default())
+                .expect("scan rules"),
                 vec![]
             )
             .await,
@@ -182,12 +192,14 @@ async fn nested_git_switch_prunes_directory_and_file_markers_including_increment
     write(root, "module/.git", "gitdir: ../.git/modules/module\n");
     write(root, "module/code.rs", "submodule source");
     let globs = vec!["**".into()];
-    let mut options = ScanRules {
-        nested_git: false,
-        no_ignore: true,
-        hidden: true,
-        ..ScanRules::default()
-    };
+    let mut options = ScanRulesUpdate {
+        nested_git: Some(false),
+        use_default_ignores: Some(false),
+        include_hidden: Some(true),
+        ..ScanRulesUpdate::default()
+    }
+    .apply(&ScanRules::default())
+    .expect("scan rules");
     assert_eq!(
         scan(root, &globs, &options, vec![]).await,
         vec![PathBuf::from("main.rs")]
@@ -197,7 +209,12 @@ async fn nested_git_switch_prunes_directory_and_file_markers_including_increment
             .await
             .is_empty()
     );
-    options.nested_git = true;
+    options = ScanRulesUpdate {
+        nested_git: Some(true),
+        ..ScanRulesUpdate::default()
+    }
+    .apply(&options)
+    .expect("updated scan rules");
     assert_eq!(
         scan(root, &globs, &options, vec![]).await,
         vec![
@@ -217,10 +234,12 @@ fn repository_marker_changes_reconcile_membership_without_affecting_workspace_ro
     let policy = make_policy(
         root,
         &[],
-        &ScanRules {
-            nested_git: false,
-            ..ScanRules::default()
-        },
+        &ScanRulesUpdate {
+            nested_git: Some(false),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("scan rules"),
     )
     .expect("policy");
     assert!(policy.can_descend(root).expect("root remains included"));
@@ -275,10 +294,12 @@ fn repository_marker_changes_reconcile_membership_without_affecting_workspace_ro
     let excluded = make_policy(
         root,
         &["!module".into()],
-        &ScanRules {
-            nested_git: false,
-            ..ScanRules::default()
-        },
+        &ScanRulesUpdate {
+            nested_git: Some(false),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("scan rules"),
     )
     .expect("excluded policy");
     assert!(
@@ -309,10 +330,12 @@ fn ignore_control_changes_invalidate_rules_even_when_not_selected() {
     let policy = make_policy(
         root,
         &[],
-        &ScanRules {
-            ignore_files: vec![external.path().to_path_buf()],
-            ..ScanRules::default()
-        },
+        &ScanRulesUpdate {
+            ignore_files: Some(vec![external.path().to_path_buf()]),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("scan rules"),
     )
     .expect("policy");
     assert!(!policy.can_descend(&root.join("blocked")).expect("excluded"));
@@ -397,11 +420,13 @@ fn external_ignore_aliases_match_canonical_change_events() {
     let policy = make_policy(
         &root,
         &[],
-        &ScanRules {
-            no_ignore: true,
-            ignore_files: vec![PathBuf::from("../rules.ignore")],
-            ..ScanRules::default()
-        },
+        &ScanRulesUpdate {
+            use_default_ignores: Some(false),
+            ignore_files: Some(vec![PathBuf::from("../rules.ignore")]),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("scan rules"),
     )
     .expect("policy");
     let rules = base.join("rules.ignore");
@@ -433,10 +458,12 @@ fn ignore_symlinks_watch_alias_and_target_and_refresh_after_retargeting() {
     let policy = make_policy(
         &root,
         &[],
-        &ScanRules {
-            ignore_files: vec![alias.clone()],
-            ..ScanRules::default()
-        },
+        &ScanRulesUpdate {
+            ignore_files: Some(vec![alias.clone()]),
+            ..ScanRulesUpdate::default()
+        }
+        .apply(&ScanRules::default())
+        .expect("scan rules"),
     )
     .expect("policy");
     assert!(policy.control_paths().contains(&alias));

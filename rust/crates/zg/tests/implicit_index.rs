@@ -117,7 +117,7 @@ fn status_uses_grouped_layout_compact_paths_and_explicit_color_policy() {
         plain.starts_with("? Workspace index is not configured\n  ~\n"),
         "{plain}"
     );
-    let storage = std::path::Path::new(".zvec-grep").join("storage");
+    let storage = std::path::Path::new(".zvec-grep").join("index");
     assert!(
         plain.contains(&format!("\n\n  Storage     {}", storage.display())),
         "{plain}"

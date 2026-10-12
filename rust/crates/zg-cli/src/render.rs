@@ -263,12 +263,6 @@ fn write_item_preview(
     if item.status == ContextItemStatus::PossiblyStale {
         writeln!(writer, "status: possibly_stale")?;
     }
-    if (options.trace || !options.human)
-        && let Some(reference) = &item.content_ref
-    {
-        writeln!(writer, "entity: {}", reference.entity_id)?;
-        writeln!(writer, "generation: {}", reference.generation)?;
-    }
     if let ContentPreview::Image { format, size_bytes } = &item.preview {
         writeln!(
             writer,
@@ -385,7 +379,6 @@ pub fn help_text(topic: Option<&str>) -> Result<String, HelpTopicError> {
         None => return Ok(main_help()),
         Some("search") => SEARCH_HELP,
         Some("index") => INDEX_HELP,
-        Some("read-content") => READ_CONTENT_HELP,
         Some("status") => STATUS_HELP,
         Some("config") => CONFIG_HELP,
         Some("auth") => AUTH_HELP,
@@ -433,7 +426,6 @@ Search:
 Management:
   --index        Build, rebuild, or drop the workspace index
   --status       Show workspace and index status
-  --read-content Retrieve indexed content by entity ID
   --config       Configure provider credentials and embedding model defaults
   --auth         Manage Workspace Remote Embedding authorization
   --server       Start, stop, inspect, or run the shared MCP server
@@ -496,7 +488,7 @@ Search scope:
 Result options:
   --limit <n>                       Total result cap, 1..2000 (default: 30); shared across groups
   --compact                         Force compact output (default for pipes)
-  --json                            Emit complete structured results, groups and content references
+  --json                            Emit complete structured results and groups
   --preview <none|short|full>       Indexed preview size (default: full on TTY, none in compact mode)
   --debug                           Print diagnostics to stderr
   --trace                           Include per-hit indexed search trace
@@ -553,7 +545,7 @@ const INDEX_HELP: &str = r"Usage:
   zg --index [root] --drop [--yes]
 
 Index options:
-  --name <NAME>                     Set or rename the unique workspace name
+  --name <NAME>                     Set or rename the workspace label
   --rebuild                         Rebuild the existing index
   --drop                            Permanently remove the workspace index
   --yes                             Confirm --drop without prompting
@@ -562,7 +554,7 @@ Index options:
 
 Embedding options:
   --embedding <model|kind=model>    Set the default or a text/code/image model; repeatable
-  --api-key <key>                   Embedding provider API key
+  --api-key <key>                   Save the default remote model's key encrypted
   --endpoint <url>                  Endpoint override for the default model
   --model-cache <path>              Local model cache directory
   --device <device>                 auto, cpu, metal, vulkan, cuda
@@ -572,8 +564,6 @@ Embedding options:
 Scan rules:
   -g, --glob <glob>                 Include paths; prefix with ! to exclude; repeatable
   --iglob <glob>                    Case-insensitive path glob; repeatable
-  -t, --type <type>                 Include a ripgrep file type; repeatable
-  -T, --type-not <type>             Exclude a ripgrep file type; repeatable
   --hidden[=true|false]              Include hidden paths except .git and .zvec-grep
   --no-ignore[=true|false]           Do not apply default or .gitignore rules
   --nested-git[=true|false]          Scan nested Git repositories and submodules
@@ -583,16 +573,20 @@ Scan rules:
   -L, --follow[=true|false]          Follow symbolic links safely
   --reset-paths                     Clear inherited scanning settings
 
+The saved key is portable with the complete .zvec-grep directory. Environment and
+global configuration keys are not saved. Omit --api-key to keep a saved key;
+repeat it to replace the key after successful indexing. Keep .zvec-grep private.
+
 Interactive remote indexing asks to allow once, allow for this workspace, or
 cancel. Non-interactive indexing requires --allow-remote or a workspace grant.
 
-A new workspace name defaults to root directory name; use --name if it is taken.
-Names are case-sensitive and unique within the per-user registry. Naming an
-existing workspace renames it while preserving file IDs and active storage.
+A new workspace name defaults to its root directory name. Names are labels;
+different roots may share a name. --name updates it after successful indexing
+while preserving file IDs and active storage. No global registration is required.
 
 Indexes text, code, PNG, JPEG and static WebP images. Each content kind selects
 one model. Unsupported default kinds are skipped; explicit unsupported models fail.
-Queries search enabled tables whose models support the input-to-content retrieval task.
+Vector queries search enabled tables whose models support the query's input kind.
 Explicit zg --index requires a default model from --embedding <model>,
 ZVEC_GREP_EMBEDDING, or configuration when creating a new index.
 Text search automatically creates a missing index with a configured local model
@@ -604,9 +598,9 @@ Use --embedding image=default to remove that override and inherit the workspace
 default, including future changes. If the default does not support images, their
 index is disabled. Omitted settings preserve saved values; a bare model changes
 only the default. Repeating the default or the same kind is an error.
-Effective model or encoding changes require --rebuild. --endpoint applies only
-to the default model; configure each other remote model's endpoint with
-zg --config model set <model> --endpoint <url>.
+Changing enabled tables, models, vector dimensions or metrics requires --rebuild.
+Changing an endpoint does not. --endpoint applies only to the default model;
+configure other remote models with zg --config model set <model> --endpoint <url>.
 Failed files are recorded; successful files remain searchable after a rebuild.
 Compatible indexes reuse their stored model.
 Rebuilding an incompatible index uses --embedding or the configured default;
@@ -621,17 +615,6 @@ Environment:
   ZVEC_GREP_DEVICE       Local embedding device: auto, cpu, metal, vulkan, or cuda
 
 See zg --help environment for precedence and Server-mode scope.";
-
-const READ_CONTENT_HELP: &str = r"Usage:
-  zg --read-content <entity-id> [root] --generation <generation> --output <file>
-
-Reads content stored in the active index. Entity ID and generation are printed
-with indexed query results. Text and code are written as UTF-8, images retain
-their original encoded bytes.
-The output file is created exclusively; existing files are never overwritten.
-References remain valid only while their entity and storage generation exist.
-Search again if the content has been removed, replaced, or the index rebuilt.
-Supports --mode direct|server|auto and --home.";
 
 const STATUS_HELP: &str = r"Usage:
   zg --status [root] [--mode <direct|server|auto>] [--check-ready] [--json]
@@ -1002,7 +985,6 @@ mod output_tests {
             score: Some(0.75),
             matched_by: MatchedBy::Fts,
             metadata: None,
-            content_ref: None,
             container: None,
             trace: None,
             query_groups: vec![],
@@ -1074,7 +1056,7 @@ mod output_tests {
     }
 
     #[test]
-    fn image_result_displays_metadata_and_reference_without_line_numbers() {
+    fn image_result_displays_metadata_without_line_numbers() {
         let mut item = indexed_item();
         item.preview = ContentPreview::Image {
             format: zg_engine::api::context::options::FileFormat::Png,
@@ -1084,10 +1066,6 @@ mod output_tests {
         item.range = ContentRange::File;
         item.content_range = ContentRange::File;
         item.excerpt_range = None;
-        item.content_ref = Some(zg_engine::api::content::ContentRef {
-            generation: "snapshot-generation".into(),
-            entity_id: "snapshot-entity".into(),
-        });
         let result = ContextResult {
             query: "image:input.png".into(),
             freshness: None,
@@ -1106,8 +1084,8 @@ mod output_tests {
         let text = String::from_utf8(output).expect("UTF-8");
         assert!(text.contains("picture.png\n"));
         assert!(text.contains("image/png; size: 123 bytes"));
-        assert!(text.contains("entity: snapshot-entity"));
-        assert!(text.contains("generation: snapshot-generation"));
+        assert!(!text.contains("entity:"));
+        assert!(!text.contains("generation:"));
         assert!(!text.contains("picture.png:"));
     }
 

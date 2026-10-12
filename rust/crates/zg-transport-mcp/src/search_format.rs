@@ -62,10 +62,6 @@ pub(crate) fn format_search_result(reply: &ContextResult, preview: SearchPreview
         );
         return lines.join("\n");
     }
-    if reply.items.iter().any(|item| item.content_ref.is_some()) {
-        lines.push("Use zvec_grep_read_content with the workspace root and a result's reference to retrieve its full indexed content.".into());
-    }
-
     if let Some(index) = &reply.diagnostics.index
         && index.query_groups.len() > 1
     {
@@ -156,7 +152,6 @@ fn append_item(lines: &mut Vec<String>, item: &ContextItem, preview: SearchPrevi
             format.as_str(),
             size_bytes
         ));
-        append_content_reference(lines, item);
         if item.status == ContextItemStatus::PossiblyStale {
             lines.push("status: possibly_stale".into());
         }
@@ -170,10 +165,9 @@ fn append_item(lines: &mut Vec<String>, item: &ContextItem, preview: SearchPrevi
         item.relative_path.display(),
         range_label(header_range)
     ));
-    if item.content_ref.is_some() {
+    if item.kind == zg_engine::api::context::result::ContextItemKind::IndexedEntity {
         lines.push(format!("type: {}", item.preview.kind().as_str()));
     }
-    append_content_reference(lines, item);
     if !item.query_groups.is_empty() {
         lines.push(format!(
             "groups: {}",
@@ -210,16 +204,6 @@ fn append_item(lines: &mut Vec<String>, item: &ContextItem, preview: SearchPrevi
             lines.push("source:".to_owned());
         }
         lines.extend(source);
-    }
-}
-
-fn append_content_reference(lines: &mut Vec<String>, item: &ContextItem) {
-    if let Some(reference) = &item.content_ref {
-        let value = serde_json::json!({
-            "generation": reference.generation,
-            "entityId": reference.entity_id,
-        });
-        lines.push(format!("reference: {value}"));
     }
 }
 

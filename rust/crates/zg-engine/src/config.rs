@@ -15,19 +15,27 @@ use std::{
 /// # Errors
 /// Returns an error when the user home cannot be resolved.
 pub fn global_config_path() -> Result<PathBuf, EngineError> {
+    optional_global_config_path()
+        .ok_or_else(|| EngineError::invalid_argument("Cannot determine user home directory"))
+}
+
+pub(crate) fn optional_global_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ZVEC_GREP_CONFIG") {
-        return Ok(PathBuf::from(path));
+        return Some(PathBuf::from(path));
     }
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    home.map(|home| PathBuf::from(home).join(".zvec-grep/config.json"))
-        .ok_or_else(|| EngineError::invalid_argument("Cannot determine user home directory"))
+    home.filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".zvec-grep/config.json"))
 }
 
 pub(crate) fn read() -> Result<Value, EngineError> {
-    read_at(&global_config_path()?)
+    match optional_global_config_path() {
+        Some(path) => read_at(&path),
+        None => Ok(json!({"version": 1})),
+    }
 }
 
 /// Reads the configured client mode after validating the global configuration.

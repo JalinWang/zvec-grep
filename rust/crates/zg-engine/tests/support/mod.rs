@@ -78,6 +78,7 @@ pub fn index_options(root: &Path) -> IndexOptions {
             device: zg_engine::api::index::options::Device::Auto,
         }),
         allow_remote: true,
+        api_key: Some("local-test-key".into()),
         ..IndexOptions::default()
     }
 }
@@ -92,15 +93,15 @@ pub fn info_options(root: &Path) -> InfoOptions {
 pub fn configure_remote_model(root: &Path, address: SocketAddr) -> std::io::Result<()> {
     let home = root.join(".zvec-grep");
     fs::create_dir_all(&home)?;
-    // Seed credentials without changing process-wide environment. Each fixture
+    // Seed endpoint settings without changing process-wide environment. Each fixture
     // keeps one globally unique name, including when its root is later moved.
     let name = format!("fixture-{}", uuid::Uuid::new_v4());
     let manifest = json!({
         "name": name, "path": home,
         "root": root, "scan": {},
-        "indexPolicy": "uninitialized", "defaultModel": null, "embeddingRoutes": {},
+        "indexPolicy": "uninitialized", "defaultEmbeddingModel": null, "embeddingRoutes": {},
         "indexVersion": null, "createdTime": 1, "updatedTime": 1,
-        "embeddingRuntimes": { "qwen/text-embedding-v4": { "apiKey": "local-test-key", "endpoint": format!("http://{address}/embeddings") } }
+        "embeddingRuntimes": { "qwen/text-embedding-v4": { "endpoint": format!("http://{address}/embeddings") } }
     });
     fs::write(home.join("manifest.json"), serde_json::to_vec(&manifest)?)
 }

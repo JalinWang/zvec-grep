@@ -36,7 +36,6 @@ use zg_cli::parse_managed_rg_args;
 use zg_engine::{
     EngineError, ErrorReport, ErrorSite, ZvecGrep,
     api::{
-        content::{Content, ContentRef, ContentResult, ReadContentOptions},
         context::{
             ContextOptions, ContextResult,
             options::{
@@ -60,11 +59,10 @@ use zg_engine::{
 };
 
 pub const AGENT_TOOL_NAME: &str = "zvec_grep_search";
-pub const FULL_TOOL_NAMES: [&str; 7] = [
+pub const FULL_TOOL_NAMES: [&str; 6] = [
     "zvec_grep_index",
     "zvec_grep_index_drop",
     "zvec_grep_index_status",
-    "zvec_grep_read_content",
     "zvec_grep_rg",
     "zvec_grep_search",
     "zvec_grep_server_status",
@@ -328,7 +326,7 @@ impl ZvecGrepMcpServer {
         }
         if toolset == McpToolset::Agent {
             for name in FULL_TOOL_NAMES {
-                if name != AGENT_TOOL_NAME && name != "zvec_grep_read_content" {
+                if name != AGENT_TOOL_NAME {
                     router.disable_route(name);
                 }
             }
@@ -385,44 +383,6 @@ impl ZvecGrepMcpServer {
             Ok(reply) => CallToolResult::success(vec![ContentBlock::text(
                 search_format::format_search_result(&reply, preview),
             )]),
-            Err(error) => error_result(&error),
-        })
-    }
-
-    #[tool(
-        name = "zvec_grep_read_content",
-        description = "Read indexed content referenced by a search result. Supply its workspace root and content reference. Returns text, code, or an image from the active index. Search again if the referenced entity was removed or replaced, or the index was rebuilt.",
-        annotations(
-            title = "Read indexed content",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn zvec_grep_read_content(
-        &self,
-        Parameters(input): Parameters<ReadContentInput>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let root = absolute_root(&input.root)
-            .map_err(|message| ErrorData::invalid_params(message, None))?;
-        let options = ReadContentOptions {
-            root: Some(root),
-            ..ReadContentOptions::new(ContentRef {
-                generation: input.reference.generation,
-                entity_id: input.reference.entity_id,
-            })
-        };
-        let result = request::run(&context, |_, signal| {
-            self.engine.read_content(ReadContentOptions {
-                signal: Some(signal),
-                ..options
-            })
-        })
-        .await;
-        Ok(match result {
-            Ok(reply) => content_result_to_tool_result(&reply),
             Err(error) => error_result(&error),
         })
     }
@@ -633,8 +593,8 @@ impl ServerHandler for ZvecGrepMcpServer {
                 if request.name == "zvec_grep_search"
                     && matches!(
                         field.as_str(),
-                        "hidden"
-                            | "noIgnore"
+                        "includeHidden"
+                            | "useDefaultIgnores"
                             | "ignoreFiles"
                             | "maxDepth"
                             | "maxFileSizeBytes"
@@ -729,11 +689,6 @@ pub enum GlobListInput {
     Rules(Vec<GlobInput>),
 }
 
-// Advertise optional numeric/boolean inputs as scalar types, with optionality
-// expressed by the object's required list. Qwen-compatible tool parsers can
-// return strings for schemars' nullable type arrays. These schema-only overrides
-// preserve strict serde types and acceptance of null as absence. Do not apply
-// them to fields where null clears a saved setting (Option<Option<T>>).
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryImageInput {
@@ -801,20 +756,11 @@ impl From<ContentKindInput> for ContentKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReadContentInput {
-    pub root: String,
-    pub reference: ContentReferenceInput,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ContentReferenceInput {
-    pub generation: String,
-    pub entity_id: String,
-}
-
+// Advertise optional numeric/boolean inputs as scalar types, with optionality
+// expressed by the object's required list. Qwen-compatible tool parsers can
+// return strings for schemars' nullable type arrays. These schema-only overrides
+// preserve strict serde types and acceptance of null as absence. Do not apply
+// them to fields where null clears a saved setting (Option<Option<T>>).
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchInput {
@@ -892,7 +838,7 @@ pub struct IndexInput {
     /// Absolute workspace root visible to the daemon.
     #[schemars(length(min = 1, max = 1024))]
     pub root: String,
-    /// Set or rename the unique workspace name; new workspaces default to the root directory name.
+    /// Set or rename the workspace label; new workspaces default to the root directory name.
     pub name: Option<String>,
     /// One-request embedding provider API key override.
     #[schemars(length(min = 1, max = 8192))]
@@ -924,13 +870,11 @@ pub struct IndexInput {
     pub globs: Option<GlobListInput>,
     /// Ordered case-insensitive rg glob rules, applied after globs.
     pub insensitive_globs: Option<PathListInput>,
-    /// Ripgrep type names, such as ts, py, h or cpp.
-    pub file_types: Option<PathListInput>,
-    pub excluded_file_types: Option<PathListInput>,
     #[schemars(extend("type" = "boolean"))]
-    pub hidden: Option<bool>,
+    pub include_hidden: Option<bool>,
+    /// Apply built-in exclusions and discovered ignore files; explicit ignore files stay active.
     #[schemars(extend("type" = "boolean"))]
-    pub no_ignore: Option<bool>,
+    pub use_default_ignores: Option<bool>,
     /// Whether indexing scans nested Git repositories and submodules.
     #[schemars(extend("type" = "boolean"))]
     pub nested_git: Option<bool>,
@@ -1217,7 +1161,7 @@ struct WorkspaceIndexOutput {
     path: String,
     root_paths: Vec<RootSpecOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    default_model_ref: Option<String>,
+    default_embedding_model_ref: Option<String>,
     tables: Vec<IndexedTableOutput>,
     embedding_routes: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1238,9 +1182,8 @@ struct RootSpecOutput {
     insensitive_globs: Vec<String>,
     glob_rules: Vec<GlobInput>,
     #[serde(skip_serializing_if = "is_false")]
-    hidden: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    no_ignore: bool,
+    include_hidden: bool,
+    use_default_ignores: bool,
     nested_git: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ignore_files: Vec<String>,
@@ -1801,8 +1744,8 @@ impl IndexInput {
 
         let glob_update = normalize_index_globs(self.globs, self.insensitive_globs)?;
         let scan = ScanRulesUpdate {
-            hidden: self.hidden,
-            no_ignore: self.no_ignore,
+            include_hidden: self.include_hidden,
+            use_default_ignores: self.use_default_ignores,
             nested_git: self.nested_git,
             ignore_files: self
                 .ignore_files
@@ -1877,8 +1820,8 @@ impl IndexInput {
             || self.reset_paths.is_some()
             || self.globs.is_some()
             || self.insensitive_globs.is_some()
-            || self.hidden.is_some()
-            || self.no_ignore.is_some()
+            || self.include_hidden.is_some()
+            || self.use_default_ignores.is_some()
             || self.nested_git.is_some()
             || self.ignore_files.is_some()
             || self.max_depth.is_some()
@@ -2196,33 +2139,6 @@ fn structured_result(value: impl Serialize) -> CallToolResult {
     }
 }
 
-fn content_result_to_tool_result(reply: &ContentResult) -> CallToolResult {
-    let content = match &reply.content {
-        Content::Text(text) | Content::Code(text) => ContentBlock::text(text),
-        Content::Image(image) => {
-            let mime = match image.format() {
-                FileFormat::Png => "image/png",
-                FileFormat::Jpeg => "image/jpeg",
-                FileFormat::Webp => "image/webp",
-                _ => {
-                    return error_result(&EngineError::unsupported(
-                        "indexed image format is not supported by MCP",
-                    ));
-                }
-            };
-            ContentBlock::image(STANDARD.encode(image.data()), mime)
-        }
-    };
-    CallToolResult::success(vec![
-        ContentBlock::text(format!(
-            "{} ({})",
-            reply.path.display(),
-            reply.content.kind().as_str(),
-        )),
-        content,
-    ])
-}
-
 fn request_root(root: Option<&Path>) -> PathBuf {
     root.map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
@@ -2301,8 +2217,8 @@ impl From<InfoResult> for IndexStatusOutput {
             id: info.name.clone(),
             name: info.name,
             path: info.path.display().to_string(),
-            root_paths: vec![RootSpecOutput::new(&info.root, info.scan)],
-            default_model_ref: info.default_model_ref,
+            root_paths: vec![RootSpecOutput::new(&info.root, &info.scan)],
+            default_embedding_model_ref: info.default_embedding_model_ref,
             embedding_routes: info
                 .embedding_routes
                 .into_iter()
@@ -2487,34 +2403,34 @@ const fn index_job_state(state: IndexOperationState) -> IndexJobState {
 }
 
 impl RootSpecOutput {
-    fn new(root: &Path, scan: ScanRules) -> Self {
+    fn new(root: &Path, scan: &ScanRules) -> Self {
         Self {
             absolute_path: root.display().to_string(),
             recursive: true,
             globs: scan
-                .globs
+                .globs()
                 .iter()
                 .filter(|rule| !rule.case_insensitive)
                 .map(|rule| rule.pattern.clone())
                 .collect(),
             insensitive_globs: scan
-                .globs
+                .globs()
                 .iter()
                 .filter(|rule| rule.case_insensitive)
                 .map(|rule| rule.pattern.clone())
                 .collect(),
-            glob_rules: scan.globs.into_iter().map(Into::into).collect(),
-            hidden: scan.hidden,
-            no_ignore: scan.no_ignore,
-            nested_git: scan.nested_git,
+            glob_rules: scan.globs().iter().cloned().map(Into::into).collect(),
+            include_hidden: scan.include_hidden(),
+            use_default_ignores: scan.use_default_ignores(),
+            nested_git: scan.nested_git(),
             ignore_files: scan
-                .ignore_files
-                .into_iter()
+                .ignore_files()
+                .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
-            max_depth: scan.max_depth,
-            max_file_size_bytes: scan.max_file_size_bytes,
-            follow: scan.follow_symlinks,
+            max_depth: scan.max_depth(),
+            max_file_size_bytes: scan.max_file_size_bytes(),
+            follow: scan.follow_symlinks(),
         }
     }
 }
@@ -2718,7 +2634,7 @@ mod tests {
             let root = test_root();
             let reply = super::InfoResult {
                 home: root.join(".zvec-grep"),
-                index_path: root.join(".zvec-grep/storage"),
+                index_path: root.join(".zvec-grep/index"),
                 root,
                 indexed: false,
                 compatibility: super::IndexCompatibility::RebuildRequired {
@@ -2761,7 +2677,7 @@ mod tests {
         let root = test_root();
         let reply = super::InfoResult {
             home: root.join(".zvec-grep"),
-            index_path: root.join(".zvec-grep/storage"),
+            index_path: root.join(".zvec-grep/index"),
             root: root.clone(),
             indexed: true,
             compatibility: super::IndexCompatibility::Compatible { version: 2 },
@@ -2773,7 +2689,7 @@ mod tests {
                 root,
                 scan: super::ScanRules::default(),
                 policy: super::WorkspaceIndexPolicy::Enabled,
-                default_model_ref: None,
+                default_embedding_model_ref: None,
                 tables: Vec::new(),
                 embedding_routes: std::collections::BTreeMap::new(),
                 fts: Some(zg_engine::api::info::result::WorkspaceIndexFts {
@@ -2976,17 +2892,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_server_exposes_search_and_content_reads() {
+    fn agent_server_exposes_search() {
         let server = ZvecGrepMcpServer::agent_direct(Arc::new(ZvecGrep::new()));
         let tools = server.listed_tools();
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "zvec_grep_read_content");
-        assert_eq!(tools[1].name, AGENT_TOOL_NAME);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, AGENT_TOOL_NAME);
         assert!(server.get_info().instructions.is_some());
     }
 
     #[test]
-    fn full_server_exposes_all_seven_tools() {
+    fn full_server_exposes_all_six_tools() {
         let server =
             ZvecGrepMcpServer::full_direct(Arc::new(ZvecGrep::new()), Arc::new(FixedStatus));
         let names = server
@@ -3022,8 +2937,8 @@ mod tests {
                         ("drop", "boolean"),
                         ("rebuild", "boolean"),
                         ("resetPaths", "boolean"),
-                        ("hidden", "boolean"),
-                        ("noIgnore", "boolean"),
+                        ("includeHidden", "boolean"),
+                        ("useDefaultIgnores", "boolean"),
                         ("nestedGit", "boolean"),
                         ("follow", "boolean"),
                         ("embeddingConcurrency", "integer"),
@@ -3109,8 +3024,8 @@ mod tests {
             "drop",
             "rebuild",
             "resetPaths",
-            "hidden",
-            "noIgnore",
+            "includeHidden",
+            "useDefaultIgnores",
             "nestedGit",
             "follow",
             "embeddingConcurrency",
@@ -3178,6 +3093,10 @@ mod tests {
             serde_json::to_value(schemars::schema_for!(IndexInput)).expect("index input schema");
         assert!(schema["properties"].get("embedding").is_some());
         assert!(schema["properties"].get("embeddingRoutes").is_some());
+        assert!(schema["properties"].get("includeHidden").is_some());
+        assert!(schema["properties"].get("hidden").is_none());
+        assert!(schema["properties"].get("useDefaultIgnores").is_some());
+        assert!(schema["properties"].get("noIgnore").is_none());
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -3185,7 +3104,7 @@ mod tests {
     fn index_updates_preserve_omitted_empty_false_and_null_values() {
         let parsed: IndexInput = serde_json::from_value(serde_json::json!({
             "root": test_root(), "globs": [],
-            "hidden": false, "followSymlinks": false, "nestedGit": false, "ignoreFiles": [],
+            "includeHidden": false, "followSymlinks": false, "nestedGit": false, "ignoreFiles": [],
             "maxDepth": null, "maxFileSizeBytes": null
         }))
         .expect("valid test fixture");
@@ -3195,10 +3114,10 @@ mod tests {
             panic!("index");
         };
         assert_eq!(options.scan.sensitive_globs, Some(Vec::new()));
-        assert_eq!(options.scan.hidden, Some(false));
+        assert_eq!(options.scan.include_hidden, Some(false));
         assert_eq!(options.scan.follow_symlinks, Some(false));
         assert_eq!(options.scan.nested_git, Some(false));
-        assert_eq!(options.scan.no_ignore, None);
+        assert_eq!(options.scan.use_default_ignores, None);
         assert_eq!(options.scan.ignore_files, Some(Vec::new()));
         assert_eq!(options.scan.max_depth, Some(None));
         assert_eq!(options.scan.max_file_size_bytes, Some(None));
@@ -3216,16 +3135,18 @@ mod tests {
         else {
             panic!("index request expected");
         };
-        let mut scan = super::ScanRules {
-            globs: vec![super::GlobRule {
+        let scan = super::ScanRulesUpdate {
+            globs: Some(vec![super::GlobRule {
                 pattern: "!secret/**".to_owned(),
                 case_insensitive: true,
-            }],
+            }]),
             ..Default::default()
-        };
-        options.scan.apply(&mut scan);
+        }
+        .apply(&super::ScanRules::default())
+        .expect("saved scan rules");
+        let scan = options.scan.apply(&scan).expect("updated scan rules");
         assert_eq!(
-            scan.globs,
+            scan.globs(),
             vec![
                 super::GlobRule {
                     pattern: "*.MD".to_owned(),
@@ -3276,12 +3197,14 @@ mod tests {
             else {
                 panic!("index request expected");
             };
-            let mut saved = super::ScanRules {
-                globs: vec![sensitive.clone(), insensitive.clone()],
+            let saved = super::ScanRulesUpdate {
+                globs: Some(vec![sensitive.clone(), insensitive.clone()]),
                 ..Default::default()
-            };
-            options.scan.apply(&mut saved);
-            assert_eq!(saved.globs, expected);
+            }
+            .apply(&super::ScanRules::default())
+            .expect("saved scan rules");
+            let updated = options.scan.apply(&saved).expect("updated scan rules");
+            assert_eq!(updated.globs(), expected);
         }
     }
 
@@ -3336,6 +3259,8 @@ mod tests {
         let output_schema = serde_json::to_value(schemars::schema_for!(super::RootSpecOutput))
             .expect("scan status schema");
         for (input_field, output_field) in [
+            ("fileTypes", "file_types"),
+            ("excludedFileTypes", "excluded_file_types"),
             ("formats", "formats"),
             ("excludedFormats", "excluded_formats"),
             ("categories", "categories"),
@@ -3350,10 +3275,11 @@ mod tests {
     }
 
     #[test]
-    fn nested_git_is_index_only_and_status_preserves_both_boolean_values() {
+    fn scan_switches_are_index_only_and_status_preserves_both_boolean_values() {
         for value in [true, false] {
             let input: IndexInput = serde_json::from_value(serde_json::json!({
-                "root": test_root(), "nestedGit": value
+                "root": test_root(), "includeHidden": value,
+                "nestedGit": value, "useDefaultIgnores": value
             }))
             .expect("index input");
             let IndexToolRequest::Index { options, .. } =
@@ -3362,23 +3288,34 @@ mod tests {
                 panic!("index");
             };
             assert_eq!(options.scan.nested_git, Some(value));
-            assert!(
-                serde_json::from_value::<SearchInput>(serde_json::json!({
-                    "root": test_root(), "query": "needle", "nestedGit": value
-                }))
-                .is_err()
-            );
+            assert_eq!(options.scan.include_hidden, Some(value));
+            assert_eq!(options.scan.use_default_ignores, Some(value));
+            for field in ["includeHidden", "nestedGit", "useDefaultIgnores"] {
+                let mut input = serde_json::json!({"root": test_root(), "query": "needle"});
+                input[field] = serde_json::json!(value);
+                assert!(serde_json::from_value::<SearchInput>(input).is_err());
+            }
             let output = super::RootSpecOutput::new(
                 &test_root(),
-                super::ScanRules {
-                    nested_git: value,
-                    ..super::ScanRules::default()
-                },
+                &super::ScanRulesUpdate {
+                    include_hidden: Some(value),
+                    nested_git: Some(value),
+                    use_default_ignores: Some(value),
+                    ..Default::default()
+                }
+                .apply(&super::ScanRules::default())
+                .expect("saved scan rules"),
             );
+            let output = serde_json::to_value(output).expect("status output");
             assert_eq!(
-                serde_json::to_value(output).expect("status output")["nested_git"],
-                value
+                output
+                    .get("include_hidden")
+                    .and_then(serde_json::Value::as_bool),
+                value.then_some(true)
             );
+            assert!(output.get("hidden").is_none());
+            assert_eq!(output["nested_git"], value);
+            assert_eq!(output["use_default_ignores"], value);
         }
         assert!(index_input().into_request().is_ok());
         let IndexToolRequest::Index { options, .. } =
@@ -3387,6 +3324,8 @@ mod tests {
             panic!("index");
         };
         assert_eq!(options.scan.nested_git, None);
+        assert_eq!(options.scan.include_hidden, None);
+        assert_eq!(options.scan.use_default_ignores, None);
     }
 
     #[test]
@@ -3415,7 +3354,7 @@ mod tests {
         assert!(request.globs.is_empty() && request.file_types.is_empty());
         assert!(
             serde_json::from_value::<SearchInput>(serde_json::json!({
-                "root": test_root(), "query": "needle", "hidden": true
+                "root": test_root(), "query": "needle", "includeHidden": true
             }))
             .is_err()
         );
@@ -3614,63 +3553,6 @@ mod tests {
     }
 
     #[test]
-    fn image_content_reads_return_an_mcp_image_block() {
-        let reply = zg_engine::api::content::ContentResult {
-            path: test_root().join("image.png"),
-            content: zg_engine::api::content::Content::Image(
-                zg_engine::api::content::ImageContent::new(
-                    vec![1, 2, 3],
-                    zg_engine::api::content::FileFormat::Png,
-                )
-                .expect("image content"),
-            ),
-        };
-        let result =
-            serde_json::to_value(super::content_result_to_tool_result(&reply)).expect("MCP image");
-        assert_eq!(result["content"][1]["type"], "image");
-        assert_eq!(result["content"][1]["mimeType"], "image/png");
-        assert_eq!(result["content"][1]["data"], "AQID");
-    }
-
-    #[test]
-    fn content_reads_accept_a_structured_reference_and_render_text_and_code() {
-        use zg_engine::api::content::{Content, ContentResult};
-
-        let input = serde_json::json!({
-            "root": test_root(),
-            "reference": {"generation":"generation", "entityId":"entity"},
-        });
-        let parsed = serde_json::from_value::<super::ReadContentInput>(input)
-            .expect("structured content reference");
-        assert_eq!(parsed.reference.generation, "generation");
-        assert_eq!(parsed.reference.entity_id, "entity");
-        assert!(
-            serde_json::from_value::<super::ReadContentInput>(serde_json::json!({
-                "root": test_root(), "generation":"generation", "entityId":"entity",
-            }))
-            .is_err()
-        );
-
-        for content in [
-            Content::Text("prose".into()),
-            Content::Code("fn main() {}".into()),
-        ] {
-            let expected = match &content {
-                Content::Text(text) | Content::Code(text) => text.clone(),
-                Content::Image(_) => unreachable!(),
-            };
-            let result =
-                serde_json::to_value(super::content_result_to_tool_result(&ContentResult {
-                    path: test_root().join("source"),
-                    content,
-                }))
-                .expect("text response");
-            assert_eq!(result["content"][1]["type"], "text");
-            assert_eq!(result["content"][1]["text"], expected);
-        }
-    }
-
-    #[test]
     fn index_content_routes_map_and_cannot_be_set_and_cleared_together() {
         use zg_engine::api::context::options::ContentKind;
         let mut input = serde_json::json!({"root":test_root(), "embedding":"local/embeddinggemma2", "embeddingRoutes":{"image":"qwen/qwen3-vl-embedding"}, "clearEmbeddingRoutes":["code"]});
@@ -3714,8 +3596,8 @@ mod tests {
                 case_insensitive: false,
             }])),
             insensitive_globs: None,
-            hidden: None,
-            no_ignore: None,
+            include_hidden: None,
+            use_default_ignores: None,
             nested_git: None,
             ignore_files: None,
             max_depth: None,

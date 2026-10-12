@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 use super::processor::{MAX_PATCHES, PATCH_DIM, image_patches};
 use crate::{
     domain::{
-        Content,
+        Content, ContentKind,
         model::{
-            Device, EmbeddingMetric, EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult,
-            ModelConfig, ModelProgress,
+            Device, EmbeddingModelInfo, EmbeddingPurpose, EmbeddingResult, ModelConfig,
+            ModelProgress,
         },
     },
     models::{
@@ -30,8 +30,8 @@ use crate::{
         catalog::{EmbeddingCatalogEntry, EmbeddingGemma2Config},
         runtime::ModelComputeRuntime,
         spi::{
-            EmbeddingModel, EmbeddingOptions, EmbeddingPrepareOptions, ModelError, validate_inputs,
-            validate_result,
+            EmbeddingModel, EmbeddingOptions, EmbeddingPrepareOptions, ModelError, QueryEncoding,
+            validate_inputs, validate_result,
         },
     },
 };
@@ -77,22 +77,13 @@ impl EmbeddingGemma2Model {
             .unwrap_or_else(default_cache);
         Ok(Self {
             entry,
-            info: EmbeddingModelInfo {
-                space: EmbeddingCatalogEntry::EmbeddingGemma2(entry).embedding_space(None),
-                retrieval: EmbeddingCatalogEntry::EmbeddingGemma2(entry).retrieval(),
-                model: EmbeddingCatalogEntry::EmbeddingGemma2(entry)
-                    .model_info()
-                    .map_err(|error| {
-                        ModelError::internal("Invalid EmbeddingGemma 2 catalog metadata")
-                            .with_cause(error)
-                            .shared()
-                    })?,
-                dimension: entry.dimension,
-                metric: EmbeddingMetric::Cosine,
-                max_batch_size: 1,
-                max_input_tokens: Some(entry.max_input_tokens),
-                max_image_bytes: Some(entry.max_image_bytes),
-            },
+            info: EmbeddingCatalogEntry::EmbeddingGemma2(entry)
+                .embedding_model_info()
+                .map_err(|error| {
+                    ModelError::internal("Invalid EmbeddingGemma 2 catalog metadata")
+                        .with_cause(error)
+                        .shared()
+                })?,
             cache_directory: cache.join(entry.source.repo).join(entry.source.revision),
             device: config.device,
             compute,
@@ -188,6 +179,20 @@ impl EmbeddingModel for EmbeddingGemma2Model {
         &self.info
     }
 
+    fn query_encoding(&self, input: ContentKind, target: ContentKind) -> QueryEncoding {
+        if input == ContentKind::Image {
+            QueryEncoding::Default
+        } else if target == ContentKind::Code {
+            QueryEncoding::TextPrefix(crate::models::catalog::GEMMA_CODE_QUERY_PREFIX)
+        } else {
+            QueryEncoding::TextPrefix(crate::models::catalog::GEMMA_QUERY_PREFIX)
+        }
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        true
+    }
+
     async fn prepare(&self, options: EmbeddingPrepareOptions) -> Result<(), ModelError> {
         self.loaded(options.on_progress, options.signal.as_ref())
             .await
@@ -225,7 +230,7 @@ impl EmbeddingModel for EmbeddingGemma2Model {
                     check_cancelled(options.signal.as_ref())?;
                     let prepared = prepare_input(
                         input,
-                        (options.purpose, options.query_target),
+                        (options.purpose, options.query_encoding),
                         &loaded.tokenizer,
                         &mut sessions.vision,
                         &run_options,
@@ -277,7 +282,7 @@ fn session(path: &Path) -> Result<Session, ModelError> {
 
 fn prepare_input(
     input: &[Content],
-    (purpose, query_target): (EmbeddingPurpose, Option<crate::domain::ContentKind>),
+    (purpose, query_encoding): (EmbeddingPurpose, QueryEncoding),
     tokenizer: &Tokenizer,
     vision: &mut Session,
     run_options: &RunOptions,
@@ -292,14 +297,9 @@ fn prepare_input(
             text.push('\n');
         }
         match content {
-            Content::Text(value) | Content::Code(value) => text.push_str(&format_text(
-                value,
-                purpose,
-                query_target.map_or_else(
-                    || matches!(content, Content::Code(_)),
-                    |kind| kind == crate::domain::ContentKind::Code,
-                ),
-            )),
+            Content::Text(value) | Content::Code(value) => {
+                text.push_str(&format_text(value, purpose, query_encoding));
+            }
             Content::Image(image) => {
                 let patches = image_patches(image.data())?;
                 if features.len() / HIDDEN_SIZE + patches.soft_tokens + 4 > max_tokens {
@@ -374,15 +374,22 @@ fn prepare_input(
     })
 }
 
-pub(super) fn format_text(text: &str, purpose: EmbeddingPurpose, code: bool) -> String {
+pub(super) fn format_text(
+    text: &str,
+    purpose: EmbeddingPurpose,
+    query_encoding: QueryEncoding,
+) -> String {
     match purpose {
         EmbeddingPurpose::Document => {
             format!("{}{text}", crate::models::catalog::GEMMA_DOCUMENT_PREFIX)
         }
-        EmbeddingPurpose::Query if code => {
-            format!("{}{text}", crate::models::catalog::GEMMA_CODE_QUERY_PREFIX)
+        EmbeddingPurpose::Query => {
+            let prefix = match query_encoding {
+                QueryEncoding::Default => crate::models::catalog::GEMMA_QUERY_PREFIX,
+                QueryEncoding::TextPrefix(prefix) => prefix,
+            };
+            format!("{prefix}{text}")
         }
-        EmbeddingPurpose::Query => format!("{}{text}", crate::models::catalog::GEMMA_QUERY_PREFIX),
     }
 }
 

@@ -115,7 +115,7 @@ async fn assert_index_and_queries(
             .workspace_index
             .expect("workspace")
             .scan
-            .globs,
+            .globs(),
         filter.globs,
         "query filters do not alter workspace configuration"
     );
@@ -285,14 +285,14 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             scan: ScanRulesUpdate {
                 globs: Some(boundary_filter.globs.clone()),
                 nested_git: Some(false),
-                no_ignore: Some(true),
+                use_default_ignores: Some(false),
                 ..ScanRulesUpdate::default()
             },
             ..index_options(root)
         })
         .await?;
     assert_eq!((indexed.files_added, indexed.files_failed), (2, 0));
-    // Neither explicit directory globs nor no_ignore may cross a disabled boundary.
+    // Neither explicit directory globs nor disabled default ignores may cross a disabled boundary.
     assert_index_and_queries(&engine, root, &boundary_filter, &outer).await?;
 
     let indexed = engine
@@ -300,7 +300,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             scan: ScanRulesUpdate {
                 globs: Some(Vec::new()),
                 nested_git: Some(true),
-                no_ignore: Some(false),
+                use_default_ignores: Some(true),
                 ..ScanRulesUpdate::default()
             },
             ..index_options(root)
@@ -317,7 +317,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             .workspace_index
             .expect("workspace after omitted update")
             .scan
-            .nested_git
+            .nested_git()
     );
     engine.close();
 
@@ -327,7 +327,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
         info.workspace_index
             .expect("reopened workspace")
             .scan
-            .nested_git
+            .nested_git()
     );
     let manifest: Value = serde_json::from_slice(&fs::read(info.home.join("manifest.json"))?)?;
     assert_eq!(manifest["scan"]["nested_git"], true);
@@ -361,7 +361,7 @@ async fn nested_git_scan_option_controls_membership_and_survives_reopen_and_rebu
             .workspace_index
             .expect("reopened workspace")
             .scan
-            .nested_git
+            .nested_git()
     );
     let manifest: Value = serde_json::from_slice(&fs::read(info.home.join("manifest.json"))?)?;
     assert_eq!(manifest["scan"]["nested_git"], false);
@@ -626,8 +626,8 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
         .index(IndexOptions {
             scan: ScanRulesUpdate {
                 globs: Some(vec!["*.txt".into()]),
-                hidden: Some(true),
-                no_ignore: Some(true),
+                include_hidden: Some(true),
+                use_default_ignores: Some(false),
                 follow_symlinks: Some(true),
                 ignore_files: Some(vec![PathBuf::from(".customignore")]),
                 max_depth: Some(Some(1)),
@@ -656,7 +656,7 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
     assert_eq!(server.inputs.load(Ordering::Acquire), inputs);
 
     let scan: ScanRulesUpdate = serde_json::from_value(json!({
-        "globs": [], "hidden": false, "no_ignore": false, "follow_symlinks": false,
+        "globs": [], "include_hidden": false, "use_default_ignores": true, "follow_symlinks": false,
         "ignore_files": [], "max_depth": null, "max_file_size_bytes": null
     }))?;
     let updated = engine
@@ -696,7 +696,7 @@ async fn explicit_empty_false_and_null_updates_persist_and_survive_rebuild() -> 
         .await?;
     assert_eq!((rebuilt.files_added, rebuilt.files_failed), (3, 0));
     let rebuilt_info = engine.info(info_options(root)).await?;
-    assert_ne!(rebuilt_info.index_path, info.index_path);
+    assert_eq!(rebuilt_info.index_path, info.index_path);
     assert_eq!(
         rebuilt_info
             .workspace_index

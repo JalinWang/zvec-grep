@@ -22,7 +22,7 @@ use crate::{
         model::{EmbeddingModelInfo, EmbeddingPurpose},
     },
     file_selection::GlobMatcher,
-    models::{EmbeddingOptions, ModelError, ModelRuntimeLease},
+    models::{EmbeddingOptions, ModelError, ModelRuntimeLease, QueryEncoding},
     storage::types::{StoragePathFilter, StorageSearchFilter, StorageSearchHit, StoredSearchData},
 };
 
@@ -76,6 +76,7 @@ pub(crate) struct SearchHit {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchPlanResult {
+    pub query_encoding: Option<QueryEncoding>,
     pub routes: Vec<ResolvedSearchRoute>,
     pub hits: Vec<SearchHit>,
     pub timings: Vec<TimingEntry>,
@@ -85,6 +86,18 @@ pub(crate) struct SearchPlanResult {
 pub(crate) trait SearchEmbeddingRuntime: Send + Sync {
     fn info(&self) -> &EmbeddingModelInfo;
 
+    fn query_encoding(
+        &self,
+        _input: ContentKind,
+        _target: ContentKind,
+    ) -> Result<QueryEncoding, ModelError> {
+        Ok(QueryEncoding::Default)
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        false
+    }
+
     fn ensure_available(&self) -> Result<(), EngineError> {
         Ok(())
     }
@@ -92,7 +105,7 @@ pub(crate) trait SearchEmbeddingRuntime: Send + Sync {
     async fn embed_queries(
         &self,
         queries: &[Content],
-        target: ContentKind,
+        encoding: QueryEncoding,
     ) -> Result<Vec<Vec<f32>>, ModelError>;
 }
 
@@ -102,10 +115,22 @@ impl SearchEmbeddingRuntime for ModelRuntimeLease {
         self.info()
     }
 
+    fn query_encoding(
+        &self,
+        input: ContentKind,
+        target: ContentKind,
+    ) -> Result<QueryEncoding, ModelError> {
+        Ok(self.query_encoding(input, target))
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        self.has_pinned_weights()
+    }
+
     async fn embed_queries(
         &self,
         queries: &[Content],
-        target: ContentKind,
+        encoding: QueryEncoding,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         self.embed(
             &queries
@@ -115,7 +140,7 @@ impl SearchEmbeddingRuntime for ModelRuntimeLease {
                 .collect::<Vec<_>>(),
             EmbeddingOptions {
                 purpose: EmbeddingPurpose::Query,
-                query_target: Some(target),
+                query_encoding: encoding,
                 ..EmbeddingOptions::default()
             },
             None,
@@ -134,7 +159,21 @@ pub(crate) struct RequestEmbeddingRuntime<'a> {
 #[async_trait]
 impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
     fn info(&self) -> &EmbeddingModelInfo {
-        self.info
+        self.model.map_or(self.info, ModelRuntimeLease::info)
+    }
+
+    fn query_encoding(
+        &self,
+        input: ContentKind,
+        target: ContentKind,
+    ) -> Result<QueryEncoding, ModelError> {
+        self.model
+            .map(|model| model.query_encoding(input, target))
+            .map_err(query_model_error)
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        self.model.is_ok_and(ModelRuntimeLease::has_pinned_weights)
     }
 
     fn ensure_available(&self) -> Result<(), EngineError> {
@@ -146,7 +185,7 @@ impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
     async fn embed_queries(
         &self,
         queries: &[Content],
-        target: ContentKind,
+        encoding: QueryEncoding,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         self.model
             .map_err(query_model_error)?
@@ -158,7 +197,7 @@ impl SearchEmbeddingRuntime for RequestEmbeddingRuntime<'_> {
                     .collect::<Vec<_>>(),
                 EmbeddingOptions {
                     purpose: EmbeddingPurpose::Query,
-                    query_target: Some(target),
+                    query_encoding: encoding,
                     signal: self.signal.clone(),
                     ..EmbeddingOptions::default()
                 },
@@ -188,7 +227,7 @@ fn query_model_error(error: &EngineError) -> ModelError {
 }
 
 /// A request-local cache: the runtime fixes model, endpoint, processing and query purpose.
-type QueryVectorCache = HashMap<(String, [u8; 32]), Vec<f32>>;
+type QueryVectorCache = HashMap<(QueryEncoding, [u8; 32]), Vec<f32>>;
 
 pub(super) struct CachedSearchRuntime<'a> {
     inner: &'a dyn SearchEmbeddingRuntime,
@@ -210,13 +249,25 @@ impl SearchEmbeddingRuntime for CachedSearchRuntime<'_> {
         self.inner.info()
     }
 
+    fn query_encoding(
+        &self,
+        input: ContentKind,
+        target: ContentKind,
+    ) -> Result<QueryEncoding, ModelError> {
+        self.inner.query_encoding(input, target)
+    }
+
+    fn has_pinned_weights(&self) -> bool {
+        self.inner.has_pinned_weights()
+    }
+
     fn ensure_available(&self) -> Result<(), EngineError> {
         self.inner.ensure_available()
     }
     async fn embed_queries(
         &self,
         queries: &[Content],
-        target: ContentKind,
+        encoding: QueryEncoding,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         let mut missing = Vec::new();
         let mut keys = HashSet::new();
@@ -226,17 +277,14 @@ impl SearchEmbeddingRuntime for CachedSearchRuntime<'_> {
                 .lock()
                 .map_err(|_| ModelError::internal("query cache lock poisoned"))?;
             for query in queries {
-                let key = (
-                    self.info().query_encoding(query.kind(), target),
-                    query.fingerprint(),
-                );
-                if !cache.contains_key(&key) && keys.insert(key.clone()) {
+                let key = (encoding, query.fingerprint());
+                if !cache.contains_key(&key) && keys.insert(key) {
                     missing.push(query.clone());
                 }
             }
         }
         if !missing.is_empty() {
-            let vectors = self.inner.embed_queries(&missing, target).await?;
+            let vectors = self.inner.embed_queries(&missing, encoding).await?;
             if vectors.len() != missing.len() {
                 return Err(ModelError::internal(
                     "embedding model returned the wrong number of query vectors",
@@ -247,13 +295,7 @@ impl SearchEmbeddingRuntime for CachedSearchRuntime<'_> {
                 .lock()
                 .map_err(|_| ModelError::internal("query cache lock poisoned"))?;
             for (content, vector) in missing.iter().zip(vectors) {
-                cache.insert(
-                    (
-                        self.info().query_encoding(content.kind(), target),
-                        content.fingerprint(),
-                    ),
-                    vector,
-                );
+                cache.insert((encoding, content.fingerprint()), vector);
             }
         }
         let cache = self
@@ -264,10 +306,7 @@ impl SearchEmbeddingRuntime for CachedSearchRuntime<'_> {
             .iter()
             .map(|query| {
                 cache
-                    .get(&(
-                        self.info().query_encoding(query.kind(), target),
-                        query.fingerprint(),
-                    ))
+                    .get(&(encoding, query.fingerprint()))
                     .cloned()
                     .ok_or_else(|| ModelError::internal("missing cached query vector"))
             })
@@ -326,6 +365,7 @@ pub(crate) async fn search_workspace_index(
     let has_searchable_files = !filter_matches_no_files(filter.as_ref());
 
     let embedding_started = Instant::now();
+    let mut query_encoding = None;
     let vectors = if has_searchable_files
         && routes
             .iter()
@@ -334,12 +374,21 @@ pub(crate) async fn search_workspace_index(
         let model = embedding_models.first().ok_or_else(|| {
             EngineError::unsupported("vector search requires a configured embedding model")
         })?;
-        if model.info().model.reference() != plan.model_ref {
+        if model.info().model().reference() != plan.model_ref {
             return Err(EngineError::invalid_argument(
                 "query runtime does not match the selected model route",
             ));
         }
-        embed_vector_routes(&routes, plan.image.as_ref(), plan.kind, *model).await?
+        let input_kind = if plan.image.is_some() {
+            ContentKind::Image
+        } else {
+            ContentKind::Text
+        };
+        let encoding = model
+            .query_encoding(input_kind, plan.kind)
+            .map_err(ModelError::into_engine_error)?;
+        query_encoding = Some(encoding);
+        embed_vector_routes(&routes, plan.image.as_ref(), encoding, *model).await?
     } else {
         HashMap::new()
     };
@@ -362,22 +411,30 @@ pub(crate) async fn search_workspace_index(
     let recall_duration = recall_started.elapsed();
 
     let fusion_started = Instant::now();
-    let fused = fuse_candidates(candidates, routes.len() == 1 && !plan.prefer_symbol);
+    let has_fts = routes
+        .iter()
+        .any(|route| route.mode == SearchRouteMode::Fts);
+    let rank_with_rules = plan.kind != ContentKind::Image && (plan.prefer_symbol || has_fts);
+    let raw_scores = !rank_with_rules && routes.len() == 1 && !plan.prefer_symbol;
+    let mut selected = fuse_candidates(candidates, raw_scores);
+    if !rank_with_rules {
+        selected.truncate(limit);
+    }
     let fusion_duration = fusion_started.elapsed();
 
     let load_started = Instant::now();
-    // Every recalled entity must be eligible for structural boosts before cutoff.
-    let hits = load_candidates(fused, limit, plan.trace, storage)?;
+    let mut hits = load_candidates(selected, limit, plan.trace, storage)?;
     let load_duration = load_started.elapsed();
     let ranking_started = Instant::now();
-    let maximum_rrf = build_recall_routes(&routes, filter.as_ref(), plan.prefer_symbol)
-        .iter()
-        .map(|_| 1.0 / (RRF_K + 1.0))
-        .sum();
-    let hits = super::ranking::rank(hits, &routes, &plan.filter, maximum_rrf, limit);
+    if rank_with_rules {
+        let recall_routes = build_recall_routes(&routes, filter.as_ref(), plan.prefer_symbol);
+        let maximum_rrf = recall_routes.iter().map(|_| 1.0 / (RRF_K + 1.0)).sum();
+        hits = super::ranking::rank(hits, &routes, &plan.filter, maximum_rrf, limit);
+    }
     let ranking_duration = ranking_started.elapsed();
 
     Ok(SearchPlanResult {
+        query_encoding,
         routes,
         hits,
         timings: vec![
@@ -450,15 +507,14 @@ struct ModelQueryVector {
 async fn embed_vector_routes(
     routes: &[ResolvedSearchRoute],
     image: Option<&ImageContent>,
-    target: ContentKind,
+    encoding: QueryEncoding,
     model: &dyn SearchEmbeddingRuntime,
 ) -> Result<HashMap<String, ModelQueryVector>, EngineError> {
-    model.info().validate()?;
     let vector_routes = routes
         .iter()
         .filter(|route| route.mode == SearchRouteMode::Vector)
         .collect::<Vec<_>>();
-    let maximum = model.info().max_batch_size;
+    let maximum = model.info().model().max_batch_size();
     let mut vectors = HashMap::new();
     for batch in vector_routes.chunks(maximum) {
         let queries = batch
@@ -471,7 +527,7 @@ async fn embed_vector_routes(
             })
             .collect::<Vec<_>>();
         let embedded = model
-            .embed_queries(&queries, target)
+            .embed_queries(&queries, encoding)
             .await
             .map_err(ModelError::into_engine_error)?;
         if embedded.len() != batch.len() {
@@ -1035,24 +1091,23 @@ mod tests {
     impl FixtureModel {
         fn new() -> Self {
             Self {
-                info: EmbeddingModelInfo {
-                    space: crate::domain::model::EmbeddingSpace::fixture(),
-                    retrieval: crate::domain::model::EmbeddingRetrieval::TextImage,
-                    model: crate::domain::model::ModelInfo::new(
+                info: EmbeddingModelInfo::new(
+                    crate::domain::model::ModelInfo::new(
                         "local",
                         "fixture",
                         [
                             crate::domain::ContentKind::Text,
                             crate::domain::ContentKind::Code,
                         ],
+                        8,
                     )
                     .expect("fixture model identity"),
-                    dimension: 2,
-                    metric: EmbeddingMetric::Cosine,
-                    max_batch_size: 8,
-                    max_input_tokens: None,
-                    max_image_bytes: None,
-                },
+                    2,
+                    EmbeddingMetric::Cosine,
+                    None,
+                    None,
+                )
+                .expect("embedding model"),
                 calls: Arc::new(Mutex::new(Vec::new())),
                 failure: None,
             }
@@ -1068,7 +1123,7 @@ mod tests {
         async fn embed_queries(
             &self,
             queries: &[Content],
-            _target: crate::domain::ContentKind,
+            _encoding: crate::models::QueryEncoding,
         ) -> Result<Vec<Vec<f32>>, ModelError> {
             if let Some(code) = self.failure {
                 return Err(ModelError::new(code, "fixture query failure", None));
@@ -1247,6 +1302,7 @@ mod tests {
         let definition_file = file(2, "src/core.ts", 100);
         let mut reference = entity(&reference_file, "vitest: Vitest");
         let mut definition = entity(&definition_file, "class Vitest {}");
+        let reference_id = reference.entity.id.clone();
         let definition_id = definition.entity.id.clone();
         for (stored, kind, name) in [
             (&mut reference, crate::domain::SymbolType::Value, "vitest"),
@@ -1271,6 +1327,10 @@ mod tests {
                 hit(&definition, 0, StorageSearchPath::Fts, 0.9),
             ],
         );
+        storage.vector = vec![
+            hit(&reference, 0, StorageSearchPath::Vector, 1.0),
+            hit(&definition, 0, StorageSearchPath::Vector, 0.9),
+        ];
         storage
             .entities
             .insert(reference.entity.id.as_str().to_owned(), reference);
@@ -1287,6 +1347,34 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(result.hits[0].entity.id, definition_id);
+        assert!(
+            result.hits[0]
+                .trace
+                .as_ref()
+                .expect("trace")
+                .ranking
+                .is_some()
+        );
+
+        let mut request = plan(vec![SearchRoute {
+            mode: SearchRouteMode::Vector,
+            query: "Vitest".to_owned(),
+        }]);
+        request.limit = Some(1);
+        let model = FixtureModel::new();
+        let result = search_workspace_index(root.path(), request, &storage, &[&model])
+            .await
+            .expect("vector search");
+        assert_eq!(result.hits[0].entity.id, reference_id);
+        assert!((result.hits[0].score - 1.0).abs() < f64::EPSILON);
+        assert!(
+            result.hits[0]
+                .trace
+                .as_ref()
+                .expect("trace")
+                .ranking
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1315,12 +1403,20 @@ mod tests {
             load_batches: Mutex::default(),
         };
         let mut model = FixtureModel::new();
-        model.info.model = crate::domain::model::ModelInfo::new(
-            "local",
-            "fixture",
-            [ContentKind::Text, ContentKind::Image],
+        model.info = EmbeddingModelInfo::new(
+            crate::domain::model::ModelInfo::new(
+                "local",
+                "fixture",
+                [ContentKind::Text, ContentKind::Image],
+                model.info.model().max_batch_size(),
+            )
+            .expect("model"),
+            model.info.dimension(),
+            model.info.metric(),
+            model.info.max_input_tokens(),
+            model.info.max_image_bytes(),
         )
-        .expect("model");
+        .expect("embedding model");
         let mut image_plan = plan(vec![SearchRoute {
             mode: SearchRouteMode::Vector,
             query: "image:sample.png".into(),
@@ -1338,6 +1434,15 @@ mod tests {
         .expect("image query");
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].entity.id, picture.entity.id);
+        assert!((result.hits[0].score - 0.8).abs() < f64::EPSILON);
+        assert!(
+            result.hits[0]
+                .trace
+                .as_ref()
+                .expect("trace")
+                .ranking
+                .is_none()
+        );
         assert_eq!(
             *model.calls.lock().expect("calls"),
             vec![vec!["<image>".to_owned()]]
@@ -1614,12 +1719,20 @@ mod tests {
         };
         let first = FixtureModel::new();
         let mut second = FixtureModel::new();
-        second.info.model = crate::domain::model::ModelInfo::new(
-            second.info.model.provider(),
-            "second",
-            second.info.model.content_kinds().iter().copied(),
+        second.info = EmbeddingModelInfo::new(
+            crate::domain::model::ModelInfo::new(
+                second.info.model().provider(),
+                "second",
+                second.info.model().content_kinds().iter().copied(),
+                second.info.model().max_batch_size(),
+            )
+            .expect("fixture model identity"),
+            second.info.dimension(),
+            second.info.metric(),
+            second.info.max_input_tokens(),
+            second.info.max_image_bytes(),
         )
-        .expect("fixture model identity");
+        .expect("embedding model");
         let mut query = plan(vec![SearchRoute {
             mode: SearchRouteMode::Vector,
             query: "Service".to_owned(),
@@ -1869,7 +1982,7 @@ mod tests {
 
     #[test]
     fn negative_format_fallback_filters_real_native_fts_and_vectors_before_top_k() {
-        use crate::domain::{ContentKind, IndexTable};
+        use crate::domain::{ContentIndex, ContentKind};
         use crate::storage::{
             IndexStore,
             types::{IndexedFragment, WorkspaceIndexStorageOptions},
@@ -1877,7 +1990,7 @@ mod tests {
         let home = tempfile::tempdir().expect("storage home");
         let store = IndexStore::open(WorkspaceIndexStorageOptions::ReadWrite {
             storage_path: home.path().to_owned(),
-            tables: vec![IndexTable {
+            tables: vec![ContentIndex {
                 kind: ContentKind::Text,
                 embedding: FixtureModel::new().info,
             }],

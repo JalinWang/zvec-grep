@@ -540,8 +540,6 @@ pub mod result {
         /// Exact source coordinates of the preview, independent of the entity and matched ranges.
         pub content_range: ContentRange,
         pub preview: ContentPreview,
-        /// Reference to the complete indexed content. Direct rg results have no reference.
-        pub content_ref: Option<crate::api::content::ContentRef>,
         /// Optional structural context supplied with the retrieved source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub outline: Option<String>,
@@ -557,7 +555,7 @@ pub mod result {
         pub coverage_group: Option<String>,
     }
 
-    /// A lightweight preview; the complete indexed content is available through `content_ref`.
+    /// Text or code excerpts, or image metadata without encoded bytes.
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
     pub enum ContentPreview {

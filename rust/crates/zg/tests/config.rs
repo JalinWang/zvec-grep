@@ -32,6 +32,9 @@ impl Fixture {
             "ZVEC_GREP_ENDPOINT",
             "ZVEC_GREP_MODEL_CACHE",
             "ZVEC_GREP_MODE",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "ZVEC_GREP_WORKSPACE_REGISTRY",
         ] {
             command.env_remove(key);
         }
@@ -338,7 +341,7 @@ fn config_merges_settings_and_index_consumes_model_defaults() {
     )
     .expect("JSON");
     assert_eq!(
-        manifest["defaultModel"]["model"]["name"],
+        manifest["defaultEmbeddingModel"]["model"]["name"],
         "potion-code-16m-v2"
     );
     assert_eq!(
@@ -449,15 +452,18 @@ fn explicit_remote_credentials_and_consent_reach_index_execution() {
         "--endpoint",
         "https://example.test/updated",
     ]);
-    assert!(!changed.status.success());
-    assert!(String::from_utf8_lossy(&changed.stderr).contains("rebuild the index"));
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
     let preserved: serde_json::Value = serde_json::from_slice(
         &fs::read(fixture.root.path().join(".zvec-grep/manifest.json")).expect("manifest"),
     )
     .expect("JSON");
     assert_eq!(
-        preserved, previous_manifest,
-        "incompatible updates preserve the active manifest"
+        preserved["storageGeneration"], previous_manifest["storageGeneration"],
+        "endpoint updates preserve the active index"
     );
     fixture.success(&[
         "--index",
@@ -482,4 +488,140 @@ fn explicit_remote_credentials_and_consent_reach_index_execution() {
         manifest["storageGeneration"],
         previous_manifest["storageGeneration"]
     );
+}
+
+fn saved_manifest(fixture: &Fixture) -> serde_json::Value {
+    serde_json::from_slice(
+        &fs::read(fixture.root.path().join(".zvec-grep/manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON")
+}
+
+fn remote_empty_index_args() -> [&'static str; 8] {
+    [
+        "--index",
+        "--mode",
+        "direct",
+        "--embedding",
+        "qwen/text-embedding-v4",
+        "--endpoint",
+        "https://example.test/embeddings",
+        "--allow-remote",
+    ]
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one CLI scenario verifies credential sources, home-free reopen, and schema rejection"
+)]
+fn workspace_credentials_follow_explicit_source_and_global_home_is_optional() {
+    let fixture = Fixture::new();
+    fixture
+        .write_config(&json!({"version":1,"providers":{"qwen":{"apiKey":"global-test-secret"}}}));
+    fixture.success(&remote_empty_index_args());
+    let reference = "qwen/text-embedding-v4";
+    assert!(saved_manifest(&fixture)["embeddingRuntimes"][reference]["apiKey"].is_null());
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join(".zvec-grep/credentials.key")
+            .exists()
+    );
+    fs::remove_file(fixture.user.path().join(".zvec-grep/config.json"))
+        .expect("remove global config");
+    let environment = fixture
+        .command(&remote_empty_index_args())
+        .env("ZVEC_GREP_API_KEY", "environment-test-secret")
+        .output()
+        .expect("index with environment key");
+    assert!(
+        environment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&environment.stderr)
+    );
+    assert!(saved_manifest(&fixture)["embeddingRuntimes"][reference]["apiKey"].is_null());
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join(".zvec-grep/credentials.key")
+            .exists()
+    );
+    let mut args = remote_empty_index_args().to_vec();
+    args.extend(["--api-key", "explicit-test-secret"]);
+    fixture.success(&args);
+    let saved = saved_manifest(&fixture);
+    assert!(saved["embeddingRuntimes"][reference]["apiKey"]["ciphertext"].is_string());
+    assert!(!saved.to_string().contains("explicit-test-secret"));
+    let root = fixture.root.path().join(".zvec-grep");
+    assert_eq!(
+        fs::read(root.join("credentials.key")).expect("key").len(),
+        32
+    );
+
+    // A fresh process resolves the saved model and key without any user home.
+    for args in [
+        vec!["--index", "--mode", "direct", "--allow-remote"],
+        vec!["--status", "--json"],
+        vec![
+            "--fts",
+            "needle",
+            "--mode",
+            "direct",
+            "--refresh",
+            "off",
+            "--json",
+        ],
+        vec![
+            "--vector",
+            "needle",
+            "--mode",
+            "direct",
+            "--refresh",
+            "off",
+            "--allow-remote",
+            "--json",
+        ],
+    ] {
+        let mut command = fixture.command(&args);
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "ZVEC_GREP_HOME",
+            "ZVEC_GREP_CONFIG",
+            "ZVEC_GREP_WORKSPACE_REGISTRY",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command.output().expect("no-home operation");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("explicit-test-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("explicit-test-secret"));
+    }
+    assert_eq!(
+        saved_manifest(&fixture)["embeddingRuntimes"],
+        saved["embeddingRuntimes"]
+    );
+    assert!(!fixture.run(&["--read-content", "entity"]).status.success());
+
+    let mut legacy = saved;
+    legacy["embeddingRuntimes"][reference]["apiKey"] = json!("legacy-secret-do-not-log");
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec(&legacy).expect("legacy JSON"),
+    )
+    .expect("old development schema");
+    let status = fixture.run(&["--status", "--mode", "direct", "--json"]);
+    let output = String::from_utf8_lossy(&status.stdout);
+    assert!(output.contains("rebuild_required"));
+    assert!(!output.contains("legacy-secret-do-not-log"));
+    assert!(!String::from_utf8_lossy(&status.stderr).contains("legacy-secret-do-not-log"));
 }

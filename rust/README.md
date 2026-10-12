@@ -45,7 +45,7 @@ Uninstall preserves that shared server until both integrations are removed.
 
 `ZvecGrep` is normally shared for the lifetime of a process. Workspace root is
 request state, so the same instance can serve multiple workspaces. It exposes
-typed `context`, `index`, `info`, `read_content`, and `drop_index` methods. It
+typed `context`, `index`, `info`, and `drop_index` methods. It
 calls its private services directly; there is no public command dispatcher,
 operation envelope, adapter registry or Core layer between a method and its
 implementation.
@@ -107,12 +107,12 @@ can activate a new runtime without deleting the persisted index. Model runtimes
 remain shared at engine scope and follow their own lease lifetime.
 
 The native engine supports indexing, indexed FTS and vector search, `zg --rg`,
-workspace discovery, `info`, indexed `read_content`, and idempotent `drop_index`.
+workspace discovery, `info`, and idempotent `drop_index`.
 
 For isolated runs, set `ZVEC_GREP_CONFIG` to a dedicated configuration file,
 `ZVEC_GREP_WORKSPACE_REGISTRY` to a dedicated registry file, `ZVEC_GREP_HOME` to a
 runtime directory, and `ZVEC_GREP_MODEL_CACHE` (or `--model-cache`) to a model cache.
-Workspace indexes remain under each source root's `.zvec-grep` directory. Existing
+Workspace indexes live in each source root's `.zvec-grep/index/` directory. Rebuilds use `.zvec-grep/temp/` until publication; generation IDs remain metadata rather than directory names. Existing
 model caches may be reused without changing the user's regular configuration.
 
 On Unix, the CLI raises its own open-file soft limit toward 4096, capped by the
@@ -149,7 +149,9 @@ one command is an error. Unsupported default kinds are skipped; invalid explicit
 model choices are errors. `--endpoint` applies to the default model; configure
 other models with `zg --config model set <model> --endpoint <url>`.
 Different kinds remain separate tables even when they share one model runtime.
-Changing an effective table's model or encoding configuration requires `--rebuild`.
+Changing enabled tables or their model, vector dimension or metric requires
+`--rebuild`. Endpoint changes, query instructions and runtime input limits do not
+require rebuilding.
 PNG, JPEG and static WebP are supported as standalone image sources.
 
 Each entity stores its complete content snapshot, source location, metadata and
@@ -164,15 +166,15 @@ Query input and target kind are independent. Use `zg --vector 'a red bicycle'
 --kind image` for image-to-image retrieval. `--input` reads one PNG, JPEG or static
 WebP file and cannot be combined with text queries. Positional queries remain
 literal text even if they name an existing file. The target table's model must
-support the task. Without `--kind`, all compatible enabled targets are
+support the query's input kind. Without `--kind`, all compatible enabled targets are
 searched. A pure vector query can combine comparable embedding spaces; other
 results are grouped by kind, each with its own ranking. Full-text/hybrid scores
 are never compared across tables. `--limit` is a total cap from 1 to 2000 (default 30), allocated
 round-robin across groups in text/code/image order. `--trace` explains targets,
-models and grouping; `--json` preserves complete structured results and content
-references. `--status --json` shows effective tables and per-kind entity counts.
-To retrieve an indexed snapshot, pass a result's generation and entity ID to
-`zg --read-content <entity-id> --generation <generation> --output <path>`.
+models and grouping; `--json` preserves paths, previews, target outcomes and result
+groups. `--status --json` shows effective tables and per-kind entity counts.
+Images return their path, format and encoded size. Public content-snapshot reading
+is not exposed; internal entity snapshots remain part of the index.
 
 Lexical search runs in-process with ripgrep's `grep` and `ignore` crates; the
 binary and ordinary CI jobs do not require a system `rg` executable.
@@ -191,6 +193,22 @@ automatic thread count. Ignore controls include `-u`/`-uu`/`-uuu`,
 internal directories. The full MCP toolset uses the same argument parser and
 engine. PCRE2, compressed-file search, explicit encoding selection, and native
 ripgrep output-format switches are rejected; Unicode BOM decoding is automatic.
+
+Workspace settings live in `.zvec-grep/manifest.json`; `index/` holds the active
+storage and rebuilds use a temporary `temp/` directory. Copy the source tree with
+its entire `.zvec-grep` directory to retain the index and settings. No global
+workspace registration is required. Global configuration remains an optional
+source of initial defaults and credentials; model assets may still use a shared
+cache or need downloading.
+
+An explicit `zg --index --api-key <key>` saves the default remote model's key,
+encrypted with XChaCha20-Poly1305. The ciphertext is in the manifest and the
+random encryption key is `.zvec-grep/credentials.key`. Repeat the command to
+replace it; an omitted key preserves the saved value. Environment and global
+configuration keys are used without being copied into the workspace. A query's
+`--api-key` is temporary. Failed/cancelled builds do not replace saved credentials.
+Anyone holding the complete workspace can decrypt its credentials; keep this in
+mind when sharing it. Dropping an index removes its saved credentials as well.
 
 ## Remote embedding authorization
 
@@ -222,7 +240,10 @@ and provider default. The signed grant at
 `.zvec-grep/authorization.json` binds the canonical workspace root, model, and
 endpoint. Changing any of them requires a new grant. The signing key lives at
 `$ZVEC_GREP_HOME/authorization.key` (default `~/.zvec-grep/authorization.key`),
-or the path selected by `ZVEC_GREP_AUTHORIZATION_KEY_FILE`.
+or the path selected by `ZVEC_GREP_AUTHORIZATION_KEY_FILE`. This signing key stays
+on the machine. Copying a workspace retains its saved API keys but requires fresh
+remote consent on another machine; an unknown signer is treated as unapproved.
+Without a global home, use `--allow-remote` for consent on that invocation.
 
 Prepare the outer directory before initializing a custom signing-key location.
 For example, with `ZVEC_GREP_HOME=/data/apps/zg`, `/data/apps` must already exist;
@@ -299,9 +320,13 @@ arguments replace the complete ordered list. Search-only `fileTypes` and
 `excludedFileTypes` use the embedded ripgrep catalog, including `h`, `cpp`, `ts`
 and `py`, independently of extractor `formats`. Index uses globs for file
 selection and also accepts `follow`.
-Search never changes persisted scan policy: `hidden`, `noIgnore`, `ignoreFiles`,
+Search never changes persisted scan policy: `includeHidden`, `useDefaultIgnores`, `ignoreFiles`,
 `maxDepth`, `maxFileSizeBytes` and `follow` belong on index requests. Node's
-indexed-search path ignores these options; Rust rejects them explicitly.
+indexed-search path ignores its corresponding scan options; Rust rejects them explicitly.
+`includeHidden` allows hidden files and directories and corresponds to CLI `--hidden`.
+`useDefaultIgnores` defaults to true. Setting it to false disables built-in and
+discovered ignore rules; explicit `ignoreFiles` remain active. CLI `--no-ignore`
+sets the same policy to false, and `--no-ignore=false` restores it to true.
 Unknown search/index fields and public nulls are rejected, except index
 `maxDepth: null` / `maxFileSizeBytes: null`, which clear saved limits.
 Existing typed globs, `formats/categories`, `enum`, `name`, `nestedGit`, diagnostic
