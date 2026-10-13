@@ -657,7 +657,6 @@ fn collect_adaptive_recall(
     let target = limit
         .saturating_mul(RECALL_TARGET_FACTOR)
         .max(RECALL_MIN_TARGET_CANDIDATES);
-    let mut previous_depth = 0;
     let mut depth = RECALL_INITIAL_DEPTH;
     loop {
         let mut saturated = false;
@@ -681,12 +680,11 @@ fn collect_adaptive_recall(
                     )?,
             };
             saturated |= hits.len() >= depth;
-            add_recall_hits(candidates, &hits, &route.route, previous_depth)?;
+            add_recall_hits(candidates, &hits, &route.route)?;
         }
         if candidates.len() >= target || !saturated || depth >= RECALL_MAX_DEPTH {
             return Ok(());
         }
-        previous_depth = depth;
         depth = (depth * RECALL_GROWTH_FACTOR).min(RECALL_MAX_DEPTH);
     }
 }
@@ -740,9 +738,9 @@ fn add_recall_hits(
     candidates: &mut HashMap<EntityId, Candidate>,
     hits: &[StorageSearchHit],
     route: &ResolvedSearchRoute,
-    start_index: usize,
 ) -> Result<(), EngineError> {
-    for (index, hit) in hits.iter().enumerate().skip(start_index) {
+    // Increasing top-k can change its prefix, including which fragments appear there.
+    for (index, hit) in hits.iter().enumerate() {
         let rank = index + 1;
         let candidate = candidates
             .entry(hit.entity_id.clone())
@@ -761,12 +759,23 @@ fn add_recall_hits(
             ));
         }
         candidate.sources.insert(route.mode);
-        candidate.evidence.push(InternalEvidence {
-            hit: hit.clone(),
-            path: route.mode,
-            route_id: route.id.clone(),
-            rank,
-        });
+        if let Some(existing) = candidate.evidence.iter_mut().find(|evidence| {
+            evidence.path == route.mode
+                && evidence.route_id == route.id
+                && evidence.hit.document_id == hit.document_id
+        }) {
+            if rank < existing.rank {
+                existing.hit = hit.clone();
+                existing.rank = rank;
+            }
+        } else {
+            candidate.evidence.push(InternalEvidence {
+                hit: hit.clone(),
+                path: route.mode,
+                route_id: route.id.clone(),
+                rank,
+            });
+        }
         add_or_update_recall(
             &mut candidate.recall,
             SearchRecallTrace {
@@ -1248,6 +1257,7 @@ mod tests {
         entities: HashMap<String, StoredEntity>,
         fts: HashMap<String, Vec<FixtureHit>>,
         vector: Vec<FixtureHit>,
+        reorder_deeper_vector_results: bool,
         filters: Arc<Mutex<Vec<Option<StorageSearchFilter>>>>,
         load_batches: Mutex<Vec<Vec<StorageSearchHit>>>,
     }
@@ -1392,7 +1402,11 @@ mod tests {
             limit: usize,
             filter: Option<&StorageSearchFilter>,
         ) -> EngineResult<Vec<StorageSearchHit>> {
-            Ok(self.hits_with_filter(&self.vector, limit, filter))
+            let mut hits = self.hits_with_filter(&self.vector, limit, filter);
+            if self.reorder_deeper_vector_results && limit > super::RECALL_INITIAL_DEPTH {
+                hits.reverse();
+            }
+            Ok(hits)
         }
     }
 
@@ -1485,20 +1499,16 @@ mod tests {
         picture.entity.content = Content::Image(image.clone());
         picture.entity.source_range = Range::Full;
         let storage = FixtureStorage {
-            paths_only: false,
-            forbid_enumeration: true,
             files: vec![source],
             entities: HashMap::from([
                 (text.entity.id.as_str().to_owned(), text.clone()),
                 (picture.entity.id.as_str().to_owned(), picture.clone()),
             ]),
-            fts: HashMap::new(),
             vector: vec![
                 hit(&text, 0, StorageSearchPath::Vector, 0.99),
                 hit(&picture, 0, StorageSearchPath::Vector, 0.8),
             ],
-            filters: Arc::new(Mutex::new(Vec::new())),
-            load_batches: Mutex::default(),
+            ..pushdown_storage()
         };
         let mut model = FixtureModel::new();
         model.info = EmbeddingModelInfo::new(
@@ -1601,6 +1611,7 @@ mod tests {
             vector: vec![b_vector, a_vector],
             filters: Arc::new(Mutex::new(Vec::new())),
             load_batches: Mutex::default(),
+            reorder_deeper_vector_results: false,
         };
         let model = FixtureModel::new();
 
@@ -1653,10 +1664,10 @@ mod tests {
         let selected = entity(&source, "selected source");
         let discarded = entity(&source, "discarded source");
         let discarded_id = discarded.entity.id.clone();
-        let mut fts = (0..205)
-            .map(|index| hit(&selected, index, StorageSearchPath::Fts, 1.0))
+        let mut vector = (0..205)
+            .map(|index| hit(&selected, index, StorageSearchPath::Vector, 1.0))
             .collect::<Vec<_>>();
-        fts.push(hit(&discarded, 0, StorageSearchPath::Fts, 0.5));
+        vector.push(hit(&discarded, 0, StorageSearchPath::Vector, 1.0));
         let mut storage = pushdown_storage();
         storage.forbid_enumeration = false;
         storage.paths_only = true;
@@ -1667,8 +1678,12 @@ mod tests {
         storage
             .entities
             .insert(discarded.entity.id.as_str().to_owned(), discarded);
-        storage.fts.insert("query".to_owned(), fts);
-        storage.vector = vec![hit(&selected, 0, StorageSearchPath::Vector, 0.9)];
+        storage.fts.insert(
+            "query".to_owned(),
+            vec![hit(&selected, 0, StorageSearchPath::Fts, 1.0)],
+        );
+        storage.vector = vector;
+        storage.reorder_deeper_vector_results = true;
         let mut plan = plan(vec![
             SearchRoute {
                 mode: SearchRouteMode::Fts,
@@ -1694,14 +1709,29 @@ mod tests {
         assert_eq!(result.hits.len(), 1);
         let selected_hit = &result.hits[0];
         assert_eq!(selected_hit.entity.id, selected.entity.id);
+        assert_eq!(
+            selected_hit
+                .evidence
+                .iter()
+                .map(|evidence| &evidence.fragment.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            205,
+            "deeper top-k must retain new fragments even when they enter the old prefix",
+        );
         assert_eq!(selected_hit.evidence.len(), 206);
         assert_eq!(
             selected_hit.evidence[0].fragment.id,
             FragmentId::new(&selected.entity.id, 0)
         );
         assert_eq!(
-            selected_hit.evidence[1].fragment.id,
-            FragmentId::new(&selected.entity.id, 0)
+            selected_hit
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.fragment.id == FragmentId::new(&selected.entity.id, 0))
+                .count(),
+            2,
+            "the same fragment remains evidence for both routes",
         );
         let trace = selected_hit.trace.as_ref().expect("trace");
         assert_eq!(trace.recall.len(), 2);
@@ -1814,6 +1844,7 @@ mod tests {
             vector: Vec::new(),
             filters: Arc::new(Mutex::new(Vec::new())),
             load_batches: Mutex::default(),
+            reorder_deeper_vector_results: false,
         };
         let first = FixtureModel::new();
         let mut second = FixtureModel::new();
@@ -1876,6 +1907,7 @@ mod tests {
             vector: Vec::new(),
             filters: Arc::clone(&filters),
             load_batches: Mutex::default(),
+            reorder_deeper_vector_results: false,
         };
         let mut plan = plan(vec![SearchRoute {
             mode: SearchRouteMode::Fts,
@@ -1957,6 +1989,7 @@ mod tests {
             vector: Vec::new(),
             filters: Arc::default(),
             load_batches: Mutex::default(),
+            reorder_deeper_vector_results: false,
         }
     }
 
