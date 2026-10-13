@@ -196,6 +196,8 @@ pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf, EngineError> {
     let mut resolved = PathBuf::new();
     for component in absolute.components() {
         match component {
+            // A Windows prefix is not a complete path until RootDir is appended.
+            std::path::Component::Prefix(_) => resolved.push(component.as_os_str()),
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 resolved.pop();
@@ -419,6 +421,53 @@ mod tests {
         assert_eq!(location.home, location.root.join(".zvec-grep"));
         assert_eq!(location.manifest_path, location.home.join("manifest.json"));
         assert_eq!(location.index_path, location.home.join("index"));
+    }
+
+    #[test]
+    fn canonical_source_paths_round_trip_before_and_after_creating_index_home() {
+        let directory = tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        fs::create_dir(&source).expect("source directory");
+        let canonical_source = fs::canonicalize(&source).expect("canonical source");
+        let home = directory.path().join("indexes/new/../active");
+        let location = workspace_index_location(&source, Some(&home)).expect("location");
+
+        assert_eq!(
+            canonical_path(&canonical_source).expect("resolve canonical source again"),
+            canonical_source
+        );
+        assert_eq!(
+            workspace_index_location(&canonical_source, Some(&home)).expect("canonical input"),
+            location
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            workspace_index_location(dunce::simplified(&canonical_source), Some(&home))
+                .expect("ordinary drive path"),
+            location
+        );
+        let root = canonical_source
+            .ancestors()
+            .last()
+            .expect("filesystem root");
+        assert_eq!(
+            canonical_path(root).expect("resolve root"),
+            fs::canonicalize(root).expect("canonical root")
+        );
+        assert!(!location.home.exists());
+        let relative = relative_source_root(&location.home, &location.root).expect("relative root");
+        assert_eq!(relative, "../../source");
+        assert_eq!(
+            resolve_source_root(&location.home, &relative).expect("restore source root"),
+            canonical_source
+        );
+
+        fs::create_dir_all(&location.home).expect("create index home");
+        assert_eq!(
+            workspace_index_location(&canonical_source, Some(&location.home))
+                .expect("reopen location"),
+            location
+        );
     }
 
     #[test]
