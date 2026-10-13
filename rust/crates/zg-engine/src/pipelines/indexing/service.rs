@@ -24,7 +24,7 @@ use crate::{
     },
     models::{
         ModelError, ModelRuntimeLease, ModelRuntimeManager, ModelRuntimeRequest,
-        ResolveEmbeddingReferenceOptions, resolve_embedding_reference,
+        ResolveEmbeddingReferenceOptions, resolve_embedding_reference, resolve_index_concurrency,
     },
     storage::{IndexStore, types::WorkspaceIndexStorageOptions},
     workspace::{
@@ -785,6 +785,8 @@ fn acquire_model(
         ));
     }
     let reference = embedding_reference(existing, options.embedding.as_ref())?;
+    let concurrency = resolve_index_concurrency(&reference, options.embedding_concurrency)
+        .map_err(ModelError::into_engine_error)?;
     let config = crate::config::read()?;
     let local = reference.starts_with("local/");
     if (!local && options.device.is_some()) || (local && options.endpoint.is_some()) {
@@ -862,7 +864,7 @@ fn acquire_model(
                 ),
                 device,
             },
-            options.embedding_concurrency,
+            concurrency,
         ))
         .map_err(ModelError::into_engine_error)
 }
@@ -2542,6 +2544,76 @@ mod tests {
             .await
             .expect("fresh initial build");
         assert!(read_manifest(&home).expect("manifest").is_some());
+        models.close();
+    }
+
+    #[tokio::test]
+    async fn index_concurrency_is_ephemeral_and_queries_ignore_refresh_overrides() {
+        let directory = tempdir().expect("workspace");
+        let root = std::fs::canonicalize(directory.path()).expect("workspace root");
+        let cache = root.join("model-cache");
+        let reference = "local/all-minilm-l6-v2";
+        let service = WorkspaceIndexService::with_test_registry();
+        let models = ModelRuntimeManager::new();
+        let mut options = empty_index_options(&root);
+        options.embedding.as_mut().expect("model").reference = reference.into();
+        options.model_cache = Some(cache.clone());
+        options.runtime_device = Some(Device::Cpu);
+        options.embedding_concurrency = Some(8);
+        service
+            .index(&models, options)
+            .await
+            .expect("empty index with override");
+        let manifest = read_manifest(&root.join(".zvec-grep"))
+            .expect("manifest")
+            .expect("index");
+        let serialized = serde_json::to_string(&manifest).expect("manifest serialization");
+        assert!(!serialized.contains("embedding_concurrency"));
+        assert!(!serialized.contains("embeddingConcurrency"));
+        // Pin the default query budget so a wrong override cannot hide behind cache eviction.
+        let query_lease = models
+            .acquire(super::ModelRuntimeRequest::new(
+                reference,
+                super::ModelConfig {
+                    cache_dir: Some(cache.clone()),
+                    device: Some(Device::Cpu),
+                    ..super::ModelConfig::default()
+                },
+                None,
+            ))
+            .expect("default query runtime");
+        for concurrency in [None, Some(24)] {
+            crate::pipelines::indexed_search::service::context(
+                &service,
+                &models,
+                &crate::api::context::ContextOptions {
+                    root: Some(root.clone()),
+                    query: Some("fixture".into()),
+                    target_kind: Some(crate::domain::ContentKind::Text),
+                    filter: crate::api::context::options::QueryFilter {
+                        globs: vec!["!**".into()],
+                        ..crate::api::context::options::QueryFilter::default()
+                    },
+                    model_cache: Some(cache.clone()),
+                    device: Some(Device::Cpu),
+                    embedding_concurrency: concurrency,
+                    auto_update: false,
+                    ..crate::api::context::ContextOptions::default()
+                },
+                None,
+                false,
+            )
+            .await
+            .expect("filtered query without inference");
+            assert_eq!(
+                models.snapshot().cached_runtimes,
+                1,
+                "queries share their default budget"
+            );
+            assert_eq!(models.snapshot().active_leases, 1);
+        }
+        assert!(!cache.exists(), "empty work does not load a model");
+        drop(query_lease);
         models.close();
     }
 

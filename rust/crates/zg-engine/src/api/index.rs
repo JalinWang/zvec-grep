@@ -41,8 +41,10 @@ pub mod options {
         /// Remove saved overrides so these kinds use the default model when supported.
         #[serde(default)]
         pub clear_embedding_routes: Vec<ContentKind>,
-        /// Maximum embedding batch tasks for this index operation.
-        /// The model default is used when omitted.
+        /// Index-only embedding concurrency: llama.cpp contexts, local inference
+        /// batches, or remote requests. Local native limits are capped at eight.
+        /// Omitted values use `ZVEC_GREP_INDEX_EMBEDDING_CONCURRENCY`, the legacy
+        /// llama.cpp index override, then the backend default; never persisted.
         pub embedding_concurrency: Option<usize>,
         /// Maximum time to wait for workspace admission, in milliseconds (default: 30 seconds).
         #[serde(default, skip_serializing_if = "Option::is_none")]

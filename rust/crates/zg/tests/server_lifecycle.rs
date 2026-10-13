@@ -1689,7 +1689,7 @@ fn index_failures_match_readiness_and_recover(mode: &str) -> Result<(), Box<dyn 
             stdout.contains(&format!("failed\t{failed_path}:")),
             "{stdout}"
         );
-        let status = run(&["--status", "--check-ready"])?;
+        let status = status_after_index(&run, mode)?;
         assert_eq!(status.status.code(), Some(1));
         let stdout = String::from_utf8_lossy(&status.stdout);
         assert!(
@@ -1704,7 +1704,7 @@ fn index_failures_match_readiness_and_recover(mode: &str) -> Result<(), Box<dyn 
         let stdout = String::from_utf8_lossy(&recovered.stdout);
         assert!(stdout.starts_with("Workspace index\nfiles\t"), "{stdout}");
         assert!(stdout.contains("0 failed"), "{stdout}");
-        assert_ready_after_index(&run, mode)?;
+        assert_command_success(&status_after_index(&run, mode)?);
         if failed_path == "broken.txt" {
             std::fs::write(&good, "Modified orchard baseline.\n")?;
             embedding.fail.store(true, Ordering::Release);
@@ -1717,21 +1717,21 @@ fn index_failures_match_readiness_and_recover(mode: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn assert_ready_after_index(
+fn status_after_index(
     run: &impl Fn(&[&str]) -> std::io::Result<Output>,
     mode: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Output, Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let status = run(&["--status", "--check-ready"])?;
-        if status.status.success() {
-            return Ok(());
-        }
         let stdout = String::from_utf8_lossy(&status.stdout);
+        // Watcher jobs can invalidate a server status scan after a manual job.
+        // Retry only that transient state; callers still check exit codes and counts.
+        if mode != "server" || !stdout.starts_with("? Workspace index status is unknown\n") {
+            return Ok(status);
+        }
         assert!(
-            mode == "server"
-                && stdout.starts_with("? Workspace index status is unknown\n")
-                && Instant::now() < deadline,
+            Instant::now() < deadline,
             "unexpected post-index status\nstdout:\n{stdout}\nstderr:\n{}",
             String::from_utf8_lossy(&status.stderr)
         );

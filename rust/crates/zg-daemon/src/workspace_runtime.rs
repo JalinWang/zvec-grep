@@ -1322,6 +1322,7 @@ fn index_template(options: &IndexOptions) -> IndexOptions {
     template.allow_remote = false;
     template.authorized_remote.clear();
     template.api_key = None;
+    template.embedding_concurrency = None;
     template.rebuild = false;
     template.reset_paths = false;
     template.changes.clear();
@@ -2032,6 +2033,7 @@ mod tests {
                 IndexOptions {
                     root: Some(workspace.path().to_path_buf()),
                     name: Some("explicit-workspace-name".into()),
+                    embedding_concurrency: Some(8),
                     ..IndexOptions::default()
                 },
                 true,
@@ -2064,16 +2066,13 @@ mod tests {
             .await
             .expect("watch change should be delivered");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if executor
-                    .calls
-                    .lock()
-                    .expect("calls should be readable")
-                    .len()
-                    == 2
-                {
-                    break;
-                }
+            while executor
+                .calls
+                .lock()
+                .expect("calls should be readable")
+                .len()
+                < 2
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -2083,7 +2082,9 @@ mod tests {
         {
             let calls = executor.calls.lock().expect("calls should be readable");
             assert_eq!(calls[0].name.as_deref(), Some("explicit-workspace-name"));
+            assert_eq!(calls[0].embedding_concurrency, Some(8));
             assert!(calls[1].name.is_none());
+            assert_eq!(calls[1].embedding_concurrency, None);
             assert_eq!(
                 calls[1].changes,
                 [IndexChange::Upsert(PathBuf::from("src/lib.rs"))]
@@ -2097,25 +2098,23 @@ mod tests {
             .await
             .expect("reconcile should be delivered");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if executor
-                    .calls
-                    .lock()
-                    .expect("calls should be readable")
-                    .len()
-                    == 3
-                {
-                    break;
-                }
+            while executor
+                .calls
+                .lock()
+                .expect("calls should be readable")
+                .len()
+                < 3
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("reconcile index should run");
-        assert_eq!(
-            executor.calls.lock().expect("calls should be readable")[2].changes,
-            [IndexChange::Rescan]
-        );
+        {
+            let calls = executor.calls.lock().expect("calls should be readable");
+            assert_eq!(calls[2].changes, [IndexChange::Rescan]);
+            assert_eq!(calls[2].embedding_concurrency, None);
+        }
     }
 
     async fn assert_nested_index_after_parent_query(rebuild: bool) {
@@ -2382,6 +2381,7 @@ mod tests {
                     rebuild: true,
                     reset_paths: true,
                     allow_remote: true,
+                    embedding_concurrency: Some(8),
                     authorized_remote: vec![zg_engine::authorization::IndexAuthorization {
                         index_dir: root.join(".zvec-grep"),
                         root: root.clone(),
@@ -2426,7 +2426,9 @@ mod tests {
             .await;
         {
             let calls = executor.calls.lock().expect("calls");
+            assert_eq!(calls[1].embedding_concurrency, Some(8));
             let watched = &calls[2];
+            assert_eq!(watched.embedding_concurrency, None);
             assert_eq!(watched.scan, ScanRulesUpdate::default());
             assert!(!watched.rebuild);
             assert!(!watched.reset_paths);
@@ -2534,7 +2536,7 @@ mod tests {
         assert_eq!(watchers.inner.closes.load(Ordering::Acquire), 1);
         assert_eq!(
             super::lock(&runtime.index_template).embedding_concurrency,
-            Some(5)
+            None
         );
         assert!(super::lock(&runtime.pending_watcher_configuration).is_none());
         manager.shutdown_all().await.expect("shutdown");
@@ -2592,9 +2594,14 @@ mod tests {
             .expect("runtime");
         assert_eq!(
             super::lock(&runtime.index_template).embedding_concurrency,
-            Some(2)
+            None
         );
         assert!(manager.runtime_snapshot(&root).watcher_active);
+        {
+            let calls = executor.calls.lock().expect("calls");
+            assert_eq!(calls[0].embedding_concurrency, Some(2));
+            assert_eq!(calls[1].embedding_concurrency, Some(99));
+        }
         manager.shutdown_all().await.expect("shutdown");
     }
 

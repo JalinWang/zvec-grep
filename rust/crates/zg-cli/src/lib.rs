@@ -569,7 +569,7 @@ pub struct IndexArgs {
     pub api_key: Option<String>,
     #[arg(long)]
     pub endpoint: Option<String>,
-    #[arg(long = "embedding-concurrency", value_parser = parse_positive_usize)]
+    #[arg(long = "index-embedding-concurrency", value_parser = parse_positive_usize)]
     pub embedding_concurrency: Option<usize>,
     #[arg(long = "allow-remote")]
     pub allow_remote: bool,
@@ -932,13 +932,37 @@ pub fn compatibility_warning_for_args(arguments: &[OsString]) -> Option<String> 
     None
 }
 
-fn management_option_with_value(value: &str) -> bool {
+fn index_concurrency_flag(text: &str) -> Result<bool, clap::Error> {
+    if text == "--embedding-concurrency" || text.starts_with("--embedding-concurrency=") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::UnknownArgument,
+            "--embedding-concurrency has been removed; use --index-embedding-concurrency with zg --index",
+        ));
+    }
+    Ok(text == "--index-embedding-concurrency"
+        || text.starts_with("--index-embedding-concurrency="))
+}
+
+fn validate_index_concurrency_scope(
+    requested: bool,
+    action: Option<(usize, &str)>,
+) -> Result<(), clap::Error> {
+    if requested && !matches!(action, Some((_, "index"))) {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--index-embedding-concurrency can only be used with zg --index",
+        ));
+    }
+    Ok(())
+}
+
+fn management_option_with_value(text: &str) -> bool {
     matches!(
-        value,
+        text,
         "--name"
             | "--embedding"
             | "--endpoint"
-            | "--embedding-concurrency"
+            | "--index-embedding-concurrency"
             | "--listen"
             | "--token-file"
             | "--mcp-toolset"
@@ -992,6 +1016,7 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
     }
     let mut action = None;
     let mut help_requested = false;
+    let mut index_concurrency_requested = false;
     let mut index = 1;
     while let Some(argument) = arguments.get(index) {
         if argument == OsStr::new("--") {
@@ -1007,6 +1032,7 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
         }
         help_requested |= matches!(argument.to_str(), Some("-h" | "--help"));
         let text = argument.to_string_lossy();
+        index_concurrency_requested |= index_concurrency_flag(&text)?;
         index += if query_option_with_value(&text)
             || managed_rg::takes_separate_value(&text)
             || management_option_with_value(&text)
@@ -1016,6 +1042,7 @@ fn normalize_command(mut arguments: Vec<OsString>) -> Result<Vec<OsString>, clap
             1
         };
     }
+    validate_index_concurrency_scope(index_concurrency_requested, action)?;
     let command = if let Some((index, command)) = action {
         arguments.remove(index);
         command
@@ -2560,6 +2587,39 @@ mod tests {
     }
 
     #[test]
+    fn index_concurrency_is_index_only_and_rejects_the_removed_spelling() {
+        for mode in ["direct", "server", "auto"] {
+            let cli = Cli::try_parse_from([
+                "zg",
+                "--index",
+                "--mode",
+                mode,
+                "--index-embedding-concurrency",
+                "4",
+            ])
+            .expect("index override");
+            let current_dir = std::env::current_dir().expect("working directory");
+            let CliPlan::Index {
+                operation: IndexOperation::Build(request),
+                ..
+            } = cli.into_plan(current_dir).expect("index plan")
+            else {
+                panic!("index")
+            };
+            assert_eq!(request.embedding_concurrency, Some(4));
+        }
+        for args in [
+            vec!["zg", "--index", "--embedding-concurrency", "4"],
+            vec!["zg", "query", "--index-embedding-concurrency", "4"],
+            vec!["zg", "--status", "--index-embedding-concurrency", "4"],
+            vec!["zg", "--index", "--index-embedding-concurrency", "0"],
+            vec!["zg", "--index", "--index-embedding-concurrency", "-1"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn parses_index_options_into_engine_request() {
         let workspace = std::env::temp_dir()
             .canonicalize()
@@ -2578,7 +2638,7 @@ mod tests {
             "CPU",
             "--model-cache",
             "/models",
-            "--embedding-concurrency",
+            "--index-embedding-concurrency",
             "4",
             "-g",
             "src/**",

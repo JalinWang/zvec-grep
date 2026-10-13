@@ -714,8 +714,7 @@ async fn index_model_candidates(
     model_prepared: &mut bool,
     stats: &mut IndexWriteStats,
 ) -> Result<(), EngineError> {
-    let mut policy =
-        resolve_embedding_policy(context.embedding_concurrency, model.concurrency_defaults())?;
+    let mut policy = resolve_index_batch_policy(context.embedding_concurrency, model)?;
     // Encoded images are cloned into canonical records, model inputs and request bodies.
     // Bound in-flight image batches even when the caller requests high concurrency.
     if diff.candidates.iter().any(|candidate| {
@@ -1662,6 +1661,22 @@ struct EmbeddingConcurrencyPolicy {
     adaptive: bool,
 }
 
+fn resolve_index_batch_policy(
+    requested: Option<usize>,
+    model: &dyn IndexEmbeddingRuntime,
+) -> Result<EmbeddingConcurrencyPolicy, EngineError> {
+    if requested == Some(0) {
+        return resolve_embedding_policy(requested, model.concurrency_defaults());
+    }
+    let reference = model.info().model().reference();
+    let requested = crate::models::resolve_index_concurrency(&reference, requested)
+        .map_err(ModelError::into_engine_error)?;
+    resolve_embedding_policy(
+        crate::models::batch_concurrency(&reference, requested),
+        model.concurrency_defaults(),
+    )
+}
+
 fn resolve_embedding_policy(
     requested: Option<usize>,
     defaults: EmbeddingConcurrencyDefaults,
@@ -1929,8 +1944,7 @@ fn validate_context(context: &IndexingContext<'_>) -> Result<(), EngineError> {
                 EngineError::invalid_argument("runtime model is not in workspace index")
             })?;
         schema.ensure_index_compatible(model.info())?;
-        let _ =
-            resolve_embedding_policy(context.embedding_concurrency, model.concurrency_defaults())?;
+        let _ = resolve_index_batch_policy(context.embedding_concurrency, *model)?;
     }
     Ok(())
 }

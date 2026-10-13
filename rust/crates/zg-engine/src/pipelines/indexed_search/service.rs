@@ -189,30 +189,19 @@ async fn try_writer_context(
             "active writer uses a different source root",
         ));
     }
-    for target in query_targets(&manifest.workspace, options, request)? {
-        if target.skip_reason.is_some() {
-            continue;
-        }
-        let model_request = search_model_request(
-            manifest,
-            target.schema,
-            options.embedding_concurrency,
-            options,
-            &location.root,
-            uses_vectors(request),
-        );
-        if let Ok(model_request) = model_request
-            && uses_vectors(request)
+    let requests = query_model_requests(manifest, options, &location.root, request)?;
+    for requested in &requests {
+        if let Ok(request) = &requested.request
             && !writer
                 .session
                 .models
                 .iter()
-                .any(|model| model.matches_request(&model_request))
+                .any(|model| model.matches_query_request(request))
         {
             return Ok(None);
         }
     }
-    let acquired = query_models(models, manifest, options, &location.root, request)?;
+    let acquired = acquire_query_models(models, manifest, requests)?;
     query_storage(
         &acquired,
         &location.root,
@@ -244,36 +233,67 @@ fn query_models(
     root: &Path,
     request: &super::context::NormalizedContextRequest,
 ) -> Result<Vec<QueryModel>, EngineError> {
+    acquire_query_models(
+        models,
+        manifest,
+        query_model_requests(manifest, options, root, request)?,
+    )
+}
+
+struct QueryModelRequest<'a> {
+    info: &'a EmbeddingModelInfo,
+    request: Result<ModelRuntimeRequest, EngineError>,
+}
+
+fn query_model_requests<'a>(
+    manifest: &'a WorkspaceManifest,
+    options: &ContextOptions,
+    root: &Path,
+    request: &super::context::NormalizedContextRequest,
+) -> Result<Vec<QueryModelRequest<'a>>, EngineError> {
     let targets = query_targets(&manifest.workspace, options, request)?;
     if !uses_vectors(request) {
         return Ok(Vec::new());
     }
-    let mut acquired: Vec<QueryModel> = Vec::new();
+    let mut requests: Vec<QueryModelRequest<'_>> = Vec::new();
     for target in targets {
         if target.skip_reason.is_some()
-            || acquired
+            || requests
                 .iter()
                 .any(|model| model.info.model().reference() == target.schema.model().reference())
         {
             continue;
         }
-        let model = acquire_search_model_for(
-            models,
-            manifest,
-            target.schema,
-            options.embedding_concurrency,
-            options,
-            root,
-        );
-        if let Ok(model) = &model {
-            assert_embedding_compatible(Some(manifest), model)?;
-        }
-        acquired.push(QueryModel {
-            info: target.schema.clone(),
-            model,
+        requests.push(QueryModelRequest {
+            info: target.schema,
+            request: search_model_request(manifest, target.schema, options, root, true),
         });
     }
-    Ok(acquired)
+    Ok(requests)
+}
+
+fn acquire_query_models(
+    models: &ModelRuntimeManager,
+    manifest: &WorkspaceManifest,
+    requests: Vec<QueryModelRequest<'_>>,
+) -> Result<Vec<QueryModel>, EngineError> {
+    requests
+        .into_iter()
+        .map(|requested| {
+            let model = requested.request.and_then(|request| {
+                models
+                    .acquire(request)
+                    .map_err(ModelError::into_engine_error)
+            });
+            if let Ok(model) = &model {
+                assert_embedding_compatible(Some(manifest), model)?;
+            }
+            Ok(QueryModel {
+                info: requested.info.clone(),
+                model,
+            })
+        })
+        .collect()
 }
 
 async fn query_storage(
@@ -412,30 +432,9 @@ pub(crate) fn query_targets<'a>(
     Ok(targets)
 }
 
-fn acquire_search_model_for(
-    models: &ModelRuntimeManager,
-    manifest: &WorkspaceManifest,
-    schema: &crate::domain::EmbeddingModelInfo,
-    embedding_concurrency: Option<usize>,
-    options: &ContextOptions,
-    root: &Path,
-) -> Result<ModelRuntimeLease, EngineError> {
-    models
-        .acquire(search_model_request(
-            manifest,
-            schema,
-            embedding_concurrency,
-            options,
-            root,
-            true,
-        )?)
-        .map_err(ModelError::into_engine_error)
-}
-
 fn search_model_request(
     manifest: &WorkspaceManifest,
     schema: &crate::domain::EmbeddingModelInfo,
-    embedding_concurrency: Option<usize>,
     options: &ContextOptions,
     root: &Path,
     authorize: bool,
@@ -495,7 +494,7 @@ fn search_model_request(
             },
             cache_dir: crate::config::model_cache(&config, options.model_cache.clone()),
         },
-        embedding_concurrency,
+        None,
     ))
 }
 
