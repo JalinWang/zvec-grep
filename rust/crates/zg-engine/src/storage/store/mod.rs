@@ -323,9 +323,6 @@ impl IndexStore {
             else {
                 return Ok(None);
             };
-            if !matches!(file.index_status, FileIndexStatus::Indexed { .. }) {
-                return Ok(None);
-            }
             Ok(Some(StoredEntity { entity, file }))
         })
     }
@@ -341,7 +338,7 @@ impl IndexStore {
             if limit == 0 || fragments::empty_filter(filter) {
                 return Ok(Vec::new());
             }
-            let filter = visible_filter(state, filter)?;
+            let filter = fragments::build_filter(filter, &|path| state.directories.get(path))?;
             state
                 .fragments
                 .search_fts(kind, query, limit, filter.as_deref())
@@ -363,7 +360,7 @@ impl IndexStore {
             if limit == 0 || fragments::empty_filter(filter) {
                 return Ok(Vec::new());
             }
-            let filter = visible_filter(state, filter)?;
+            let filter = fragments::build_filter(filter, &|path| state.directories.get(path))?;
             let mut hits = state
                 .fragments
                 .search_vector(kind, vector, limit, filter.as_deref())?;
@@ -437,11 +434,8 @@ impl IndexStore {
         self.write(|state| {
             state.needs_optimize = true;
             state.files.mark_deleting(file_id)?;
-            state.files.flush()?;
             state.fragments.delete_file(file_id)?;
             state.entities.delete_file(file_id)?;
-            state.fragments.flush()?;
-            state.entities.flush()?;
             state.files.delete(file_id)
         })
     }
@@ -512,39 +506,11 @@ fn replace_file(
     let mut unfinished = file.clone();
     unfinished.index_status = FileIndexStatus::NotIndexed;
     state.files.put(&unfinished, &directories)?;
-    state.files.flush()?;
     state.fragments.delete_file(file.id)?;
     state.entities.delete_file(file.id)?;
     state.entities.write(&entity_docs)?;
     state.fragments.write(&fragment_docs)?;
-    state.directories.flush()?;
-    state.entities.flush()?;
-    state.fragments.flush()?;
     state.files.put(file, &directories)
-}
-
-// File status is the commit marker shared by all retrieval tables. Exclude
-// incomplete writes before top-k, rather than letting them displace valid hits.
-fn visible_filter(
-    state: &StoreState,
-    filter: Option<&StorageSearchFilter>,
-) -> EngineResult<Option<String>> {
-    let requested = fragments::build_filter(filter, &|path| state.directories.get(path))?;
-    let unfinished = state
-        .files
-        .list()?
-        .into_iter()
-        .filter(|file| !matches!(file.index_status, FileIndexStatus::Indexed { .. }))
-        .map(|file| file.id.to_string())
-        .collect::<Vec<_>>();
-    if unfinished.is_empty() {
-        return Ok(requested);
-    }
-    let visible = format!("file_id NOT IN ({})", unfinished.join(", "));
-    Ok(Some(requested.map_or_else(
-        || visible.clone(),
-        |requested| format!("({requested}) AND {visible}"),
-    )))
 }
 
 fn load_search_hits(
@@ -572,9 +538,6 @@ fn load_search_hits(
         let Some(file) = files.get(&entity.file_id) else {
             continue;
         };
-        if !matches!(file.index_status, FileIndexStatus::Indexed { .. }) {
-            continue;
-        }
         for fragment in &entity.fragments {
             if fragments
                 .insert(fragment.id.as_str().to_owned(), fragment.clone())

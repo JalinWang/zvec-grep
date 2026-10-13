@@ -186,18 +186,8 @@ fn write_indexed_items(
 }
 
 fn empty_message(result: &ContextResult) -> &'static str {
-    use zg_engine::api::context::result::{EmptyReason, IndexTargetStatus};
-    if result.diagnostics.empty_reason == Some(EmptyReason::NoSearchableFiles)
-        || result.diagnostics.index.as_ref().is_some_and(|index| {
-            !index.targets.is_empty()
-                && index
-                    .targets
-                    .iter()
-                    .all(|target| target.status == IndexTargetStatus::Empty)
-        })
-    {
-        "Selected index tables are empty."
-    } else if result.diagnostics.empty_reason == Some(EmptyReason::NoSupportedTargets) {
+    use zg_engine::api::context::result::EmptyReason;
+    if result.diagnostics.empty_reason == Some(EmptyReason::NoSupportedTargets) {
         "No enabled index table supports this query."
     } else {
         "No matches."

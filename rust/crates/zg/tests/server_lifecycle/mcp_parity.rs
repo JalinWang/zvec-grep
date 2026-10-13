@@ -17,6 +17,8 @@ fn multimodal_targets_and_groups_survive_direct_server_and_mcp() -> Result<(), B
         configure_multimodal_command(command, &home, &workspace);
     })?;
     let port = guard.listen.parse::<SocketAddr>()?.port();
+    let image_path = workspace.path().join("picture.png");
+    let image_path_text = path_text(&image_path)?;
     for (query, mcp_query) in [
         (&["--vector", "orchard"][..], json!({"vector":"orchard"})),
         (&["orchard"][..], json!({"query":"orchard"})),
@@ -30,8 +32,8 @@ fn multimodal_targets_and_groups_survive_direct_server_and_mcp() -> Result<(), B
             json!({"fts":"orchard", "vector":"fruit", "fuse":true}),
         ),
         (
-            &["--input", "picture.png"][..],
-            json!({"queryImage":{"source":"path", "path":workspace.path().join("picture.png").canonicalize()?}}),
+            &["--input", image_path_text][..],
+            json!({"queryImage":{"source":"path", "path":image_path_text}}),
         ),
     ] {
         check_multimodal_queries(&binary, &home, &workspace, port, query, &mcp_query)?;

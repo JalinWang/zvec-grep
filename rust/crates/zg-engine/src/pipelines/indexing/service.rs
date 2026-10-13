@@ -394,7 +394,7 @@ impl WorkspaceIndexService {
     async fn read_status(
         &self,
         manifest: &WorkspaceManifest,
-        compare_contents: bool,
+        detailed: bool,
     ) -> Result<crate::api::info::result::IndexStats, EngineError> {
         let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.index_path(),
@@ -413,7 +413,7 @@ impl WorkspaceIndexService {
             &storage,
             &self.scanner,
             None,
-            compare_contents,
+            detailed,
         )
         .await;
         let close = storage.close();

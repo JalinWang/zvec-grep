@@ -12,9 +12,6 @@ use crate::{
 };
 
 pub(crate) trait SearchStorage: Send + Sync {
-    fn entity_counts(&self) -> EngineResult<std::collections::BTreeMap<ContentKind, u64>> {
-        Ok(std::collections::BTreeMap::new())
-    }
     fn list_file_paths(&self) -> EngineResult<Vec<(FileId, PathBuf)>>;
     fn list_file_attributes(&self) -> EngineResult<Vec<StoredFileAttributes>>;
     fn has_non_unicode_file_names(&self) -> EngineResult<bool>;
@@ -36,9 +33,6 @@ pub(crate) trait SearchStorage: Send + Sync {
 }
 
 impl SearchStorage for IndexStore {
-    fn entity_counts(&self) -> EngineResult<std::collections::BTreeMap<ContentKind, u64>> {
-        self.entity_counts()
-    }
     fn list_file_paths(&self) -> EngineResult<Vec<(FileId, PathBuf)>> {
         self.list_file_paths()
     }

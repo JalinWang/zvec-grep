@@ -500,7 +500,7 @@ async fn indexed_cli_queries_do_not_wait_for_incremental_writer() {
 #[test]
 fn missing_index_uses_default_local_model_without_polluting_query_stdout() {
     let fixture = Fixture::new();
-    // Empty workspaces and FTS-only queries never download or execute a model.
+    // Building this empty workspace and querying FTS need no model inference.
     let output = fixture.success(&["--mode", "direct", "--fts", "needle", "--no-color"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -508,10 +508,7 @@ fn missing_index_uses_default_local_model_without_polluting_query_stdout() {
         "{stderr}"
     );
     assert!(stderr.contains("Index complete"), "{stderr}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "Selected index tables are empty.\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
     fixture.assert_model("direct", "local/potion-code-16m-v2");
 }
 
@@ -586,10 +583,7 @@ fn auto_and_server_build_at_the_query_root_not_the_daemon_working_directory() {
             "{stderr}"
         );
         assert!(stderr.contains("Index complete"), "{stderr}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "Selected index tables are empty.\n"
-        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
         let status = success(
             fixture
                 .command(&["--status", "--mode", mode, "--no-color"])
@@ -708,10 +702,7 @@ fn existing_local_and_remote_indexes_are_reused_from_nested_directories() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!stderr.contains("No index found"), "{stderr}");
             assert!(!stderr.contains("Index complete"), "{stderr}");
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
-                "Selected index tables are empty.\n"
-            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "No matches.\n");
             fixture.assert_model(mode, reference);
             assert!(!nested.join(".zvec-grep").exists());
         }

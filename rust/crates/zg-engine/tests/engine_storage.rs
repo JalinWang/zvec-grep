@@ -1139,9 +1139,8 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         assert_eq!(files.len(), 1);
         files[0].get_string("payload")?.expect("source payload")
     };
-    // Simulate interruption after recording NotIndexed. Opening the store must
-    // preserve recovery records until indexing retries, while keeping incomplete
-    // projections hidden from readers.
+    // Simulate interruption after recording NotIndexed. Opening the store keeps
+    // recovery records and returns loadable content as possibly stale until retry.
     let original: Value = serde_json::from_str(&source)?;
     let id = u32::try_from(original["id"].as_u64().expect("file ID"))?;
     set_native_file_status(&index_path, id, "not_indexed")?;
@@ -1161,7 +1160,21 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
         (1, 0, 0)
     );
     assert!(!index_path.join("pending.json").exists());
-    assert!(fts_paths(&engine, root, "orchard").await?.is_empty());
+    let pending = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            routes: vec![ContextRoute {
+                mode: ContextRouteMode::Fts,
+                query: "orchard".into(),
+            }],
+            auto_update: false,
+            allow_remote: true,
+            ..ContextOptions::default()
+        })
+        .await?;
+    assert_eq!(pending.items.len(), 1);
+    assert_eq!(pending.items[0].relative_path, Path::new("note.txt"));
+    assert_eq!(pending.items[0].status, ContextItemStatus::PossiblyStale);
     assert_eq!(server.requests.load(Ordering::Acquire), requests);
     engine.close();
     drop(engine);
@@ -1243,12 +1256,9 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
             ..ContextOptions::default()
         })
         .await?;
-    assert!(
-        vector
-            .items
-            .iter()
-            .any(|item| item.relative_path == Path::new("note.txt"))
-    );
+    assert_eq!(vector.items.len(), 1);
+    assert_eq!(vector.items[0].relative_path, Path::new("note.txt"));
+    assert_eq!(vector.items[0].status, ContextItemStatus::Fresh);
     let after_search = server.requests.load(Ordering::Acquire);
     let unchanged = engine.index(index_options(root)).await?;
     assert_eq!(unchanged.files_unchanged, 1);

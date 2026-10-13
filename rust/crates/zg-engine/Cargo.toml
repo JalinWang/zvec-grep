@@ -71,5 +71,8 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["directm
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

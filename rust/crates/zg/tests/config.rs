@@ -167,7 +167,7 @@ fn force_direct_uses_resolved_environment_mode() {
     fixture.write_config(&json!({"version": 1, "client": {"mode": "server"}}));
 
     let direct = fixture
-        .command(&["--force-direct", "--json", "needle"])
+        .command(&["--force-direct", "--json", "--fts", "needle"])
         .env("ZVEC_GREP_MODE", "direct")
         .output()
         .expect("environment direct mode");
@@ -182,7 +182,7 @@ fn force_direct_uses_resolved_environment_mode() {
     assert_eq!(result["items"], json!([]));
 
     let server = fixture
-        .command(&["--force-direct", "--json", "needle"])
+        .command(&["--force-direct", "--json", "--fts", "needle"])
         .env("ZVEC_GREP_MODE", "server")
         .output()
         .expect("environment server mode");
@@ -199,7 +199,7 @@ fn force_direct_uses_resolved_global_mode() {
     let fixture = Fixture::new();
     fixture.write_config(&json!({"version": 1, "client": {"mode": "direct"}}));
 
-    let direct = fixture.run(&["--force-direct", "--json", "needle"]);
+    let direct = fixture.run(&["--force-direct", "--json", "--fts", "needle"]);
     assert!(
         direct.status.success(),
         "{}",
@@ -211,7 +211,7 @@ fn force_direct_uses_resolved_global_mode() {
     assert_eq!(result["items"], json!([]));
 
     fixture.write_config(&json!({"version": 1, "client": {"mode": "server"}}));
-    let server = fixture.run(&["--force-direct", "--json", "needle"]);
+    let server = fixture.run(&["--force-direct", "--json", "--fts", "needle"]);
     assert!(!server.status.success());
     assert!(
         String::from_utf8_lossy(&server.stderr).contains("--force-direct requires --mode direct"),
@@ -562,6 +562,7 @@ fn workspace_credentials_follow_explicit_source_and_global_home_is_optional() {
     );
 
     // A fresh process resolves the saved model and key without any user home.
+    // Exclude all paths for the vector query to validate runtime setup without inference.
     for args in [
         vec!["--index", "--mode", "direct", "--allow-remote"],
         vec!["--status", "--json"],
@@ -577,6 +578,8 @@ fn workspace_credentials_follow_explicit_source_and_global_home_is_optional() {
         vec![
             "--vector",
             "needle",
+            "--glob",
+            "!**",
             "--mode",
             "direct",
             "--refresh",

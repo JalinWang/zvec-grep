@@ -49,9 +49,6 @@ pub(crate) fn format_search_result(reply: &ContextResult, preview: SearchPreview
     if reply.items.is_empty() {
         lines.push(
             match reply.diagnostics.empty_reason {
-                Some(EmptyReason::NoSearchableFiles) if reply.diagnostics.index.is_some() => {
-                    "Selected index tables are empty."
-                }
                 Some(EmptyReason::NoSearchableFiles) => "No searchable files.",
                 Some(EmptyReason::NoSupportedTargets) => {
                     "No enabled index table supports this query."

@@ -678,7 +678,6 @@ pub mod result {
     #[serde(rename_all = "snake_case")]
     pub enum IndexTargetStatus {
         Searched,
-        Empty,
         Skipped,
         Failed,
     }

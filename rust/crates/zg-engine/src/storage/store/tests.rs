@@ -1923,7 +1923,7 @@ fn missing_kind_table_requires_rebuild_instead_of_opening_an_empty_table() {
 }
 
 #[test]
-fn interrupted_kind_replacement_is_hidden_before_top_k_and_recovers_after_reopen() {
+fn interrupted_kind_replacement_keeps_readable_records_and_recovers_after_reopen() {
     let home = tempfile::tempdir().expect("workspace");
     let store = open_multi_model(home.path());
     let (file, entries) = multi_model_file(&store);
@@ -1936,14 +1936,13 @@ fn interrupted_kind_replacement_is_hidden_before_top_k_and_recovers_after_reopen
         .expect("healthy fallback");
     let (entities, projections) = fixture_records(&entries);
     // Emulate interruption after text has been replaced and the image table has
-    // not yet been written. The durable file marker keeps both kinds invisible.
+    // not yet been written. Surviving records remain readable until retry.
     store
         .write(|state| {
             let directories = state.directories.ensure(&file.relative_path)?;
             let mut unfinished = file.clone();
             unfinished.index_status = FileIndexStatus::NotIndexed;
             state.files.put(&unfinished, &directories)?;
-            state.files.flush()?;
             state.fragments.delete_file(file.id)?;
             let mut prepared = Fragments::prepare(&file, &entities, &projections, &directories)?;
             prepared.remove(&ContentKind::Image);
@@ -1954,20 +1953,28 @@ fn interrupted_kind_replacement_is_hidden_before_top_k_and_recovers_after_reopen
     let reader = open(home.path(), true);
     let hits = reader
         .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], 1, None)
-        .expect("filter before top-k");
+        .expect("surviving text projection");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].file_id, healthy_file.id);
-    assert!(
-        reader
-            .search_vector(ContentKind::Image, &[0.0, 1.0], 1, None)
-            .expect("hidden image")
-            .is_empty()
+    assert_eq!(hits[0].file_id, file.id);
+    let loaded = reader.load_search_hits(&hits).expect("readable text");
+    assert_eq!(loaded.entities[&entities[0].id].entity, entities[0]);
+    assert_eq!(
+        loaded.entities[&entities[0].id].file.index_status,
+        FileIndexStatus::NotIndexed
     );
     assert!(
         reader
+            .search_vector(ContentKind::Image, &[0.0, 1.0], 1, None)
+            .expect("image projection not yet written")
+            .is_empty()
+    );
+    assert_eq!(
+        reader
             .read_entity(&entities[0].id)
-            .expect("hidden snapshot")
-            .is_none()
+            .expect("surviving snapshot")
+            .expect("entity")
+            .entity,
+        entities[0]
     );
     assert_eq!(
         reader.entity_counts().expect("committed counts"),
@@ -1985,6 +1992,79 @@ fn interrupted_kind_replacement_is_hidden_before_top_k_and_recovers_after_reopen
             .search_vector(entry.kind, &entry.vector, 1, None)
             .expect("restored kind");
         assert_eq!(hits[0].entity_id, entry.entity.id);
+    }
+}
+
+#[test]
+fn bulk_writes_reopen_with_limited_file_descriptors() {
+    const CHILD: &str = "ZG_STORAGE_BULK_WRITE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let executable = std::env::current_exe().expect("test executable");
+        // Isolate the limit from parallel tests and native background workers.
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "storage::store::tests::bulk_writes_reopen_with_limited_file_descriptors",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated writer");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let maximum = getrlimit(Resource::Nofile).maximum;
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(maximum.unwrap_or(512).min(512)),
+                maximum,
+            },
+        )
+        .expect("limit file descriptors in the child");
+    }
+
+    let home = tempfile::Builder::new()
+        .prefix("zg-bulk-")
+        .tempdir()
+        .expect("workspace");
+    let store = open(home.path(), false);
+    let mut expected = Vec::new();
+    for index in 0..513 {
+        let (file, entry) = file_at(&store, &format!("docs/{index}.txt"));
+        expected.push(file.id);
+        store
+            .replace_fixture_file(&file, &[entry])
+            .expect("write file");
+    }
+    store.finalize_writes().expect("finalize bulk writes");
+    store.close().expect("close writer");
+    let reader = open(home.path(), true);
+    assert_eq!(
+        reader.list_files().expect("reopened files").len(),
+        expected.len()
+    );
+    for hits in [
+        reader
+            .search_fts(ContentKind::Text, "orchard", expected.len(), None)
+            .expect("reopened FTS"),
+        reader
+            .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], expected.len(), None)
+            .expect("reopened vectors"),
+    ] {
+        let mut actual = hits.into_iter().map(|hit| hit.file_id).collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 }
 

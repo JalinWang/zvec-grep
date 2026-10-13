@@ -2561,6 +2561,9 @@ mod tests {
 
     #[test]
     fn parses_index_options_into_engine_request() {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary directory");
         let cli = Cli::try_parse_from([
             "zg",
             "--index",
@@ -2586,11 +2589,11 @@ mod tests {
         let CliPlan::Index {
             operation: IndexOperation::Build(request),
             ..
-        } = cli.into_plan(PathBuf::from("/workspace")).expect("plan")
+        } = cli.into_plan(workspace.clone()).expect("plan")
         else {
             panic!("index build")
         };
-        assert_eq!(request.root, Some(PathBuf::from("/workspace/repo")));
+        assert_eq!(request.root, Some(workspace.join("repo")));
         assert_eq!(request.name.as_deref(), Some("search-engine"));
         assert_eq!(request.embedding_concurrency, Some(4));
         assert_eq!(

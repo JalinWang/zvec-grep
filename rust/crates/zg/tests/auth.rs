@@ -310,11 +310,14 @@ fn resident_server_observes_grant_and_revoke_without_restart() {
         "server",
         "--vector",
         "needle",
+        "--glob",
+        "!**",
         "--refresh",
         "off",
         "--json",
     ];
-    // The explicit indexing key is retained; empty-table queries need no network call.
+    // The explicit indexing key is retained. Excluding all paths avoids inference
+    // while still checking the daemon's current remote authorization.
     fixture.success(&search);
     fixture.success(&["--auth", "revoke"]);
     assert!(

@@ -178,7 +178,6 @@ pub(crate) async fn context_from_index(
     let targets = super::service::query_targets(workspace, options, request)?;
     let groups = query_groups(options, request);
     let limit = options.limit.unwrap_or(DEFAULT_CONTEXT_TOTAL_LIMIT);
-    let counts = storage.entity_counts()?;
     let cached = embedding_models
         .iter()
         .map(|model| super::pipeline::CachedSearchRuntime::new(*model))
@@ -201,7 +200,6 @@ pub(crate) async fn context_from_index(
             targets_diagnostics.push(diagnostic);
             continue;
         }
-        let empty = counts.get(&target.kind) == Some(&0);
         let recall = recall_table(
             &workspace.root,
             &target,
@@ -210,7 +208,6 @@ pub(crate) async fn context_from_index(
             &cached,
             options,
             request,
-            empty,
         )
         .await;
         let recall = match recall {
@@ -228,9 +225,6 @@ pub(crate) async fn context_from_index(
                 continue;
             }
         };
-        if empty {
-            diagnostic.status = IndexTargetStatus::Empty;
-        }
         pool_table_recall(&mut recalls, recall);
         targets_diagnostics.push(diagnostic);
     }
@@ -328,7 +322,6 @@ async fn recall_table(
     cached: &[super::pipeline::CachedSearchRuntime<'_>],
     options: &ContextOptions,
     request: &NormalizedContextRequest,
-    empty: bool,
 ) -> Result<TableRecall, EngineError> {
     let groups = target_query_groups(groups, target.kind);
     let prefer_symbol = options.prefer_symbol && target.kind == ContentKind::Code;
@@ -360,7 +353,6 @@ async fn recall_table(
         &groups,
         storage,
         runtime,
-        empty,
     )
     .await?;
     let query_encoding = runtime
@@ -443,13 +435,9 @@ async fn recall_target(
     groups: &[NormalizedContextGroup],
     storage: &dyn SearchStorage,
     runtime: Option<&super::pipeline::CachedSearchRuntime<'_>>,
-    empty: bool,
 ) -> Result<Vec<RecalledSearch>, EngineError> {
     if let Some(runtime) = runtime {
         runtime.ensure_available()?;
-    }
-    if empty {
-        return Ok(Vec::new());
     }
     let runtimes = runtime
         .map(|runtime| vec![runtime as &dyn SearchEmbeddingRuntime])
@@ -594,12 +582,6 @@ fn finish_context_result(
         .all(|t| t.status == IndexTargetStatus::Skipped)
     {
         Some(EmptyReason::NoSupportedTargets)
-    } else if targets
-        .iter()
-        .filter(|t| t.status != IndexTargetStatus::Skipped)
-        .all(|t| t.status == IndexTargetStatus::Empty)
-    {
-        Some(EmptyReason::NoSearchableFiles)
     } else {
         Some(EmptyReason::NoMatches)
     };
@@ -1470,6 +1452,22 @@ mod tests {
                 PathBuf::from("src/file.txt")
             );
             assert_eq!(result.items[0].item.status, ContextItemStatus::Fresh);
+        }
+        for status in [FileIndexStatus::NotIndexed, FileIndexStatus::Deleting] {
+            let mut interrupted = search.clone();
+            interrupted.hits[0].file.index_status = status;
+            let result = super::build_table_result(
+                &workspace.root,
+                &request,
+                &request.groups,
+                vec![interrupted],
+            )
+            .expect("read remaining indexed content");
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(
+                result.items[0].item.status,
+                ContextItemStatus::PossiblyStale
+            );
         }
         assert_eq!(
             super::file_freshness_status(&original_root, &file),

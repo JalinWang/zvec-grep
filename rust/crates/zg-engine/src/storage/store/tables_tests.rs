@@ -562,7 +562,7 @@ fn fragment_ids_cannot_be_reused_by_another_file_in_a_different_model_table() {
 }
 
 #[test]
-fn interrupted_replacements_are_hidden_and_retry_removes_stale_fragments() {
+fn interrupted_replacements_remain_readable_and_retry_removes_stale_fragments() {
     let home = tempfile::tempdir().expect("storage");
     let store = metadata_store(home.path());
     let (mut source, entities, entries) = metadata_fragments(0, "old-owner");
@@ -589,32 +589,34 @@ fn interrupted_replacements_are_hidden_and_retry_removes_stale_fragments() {
     let store = metadata_store(home.path());
     assert_eq!(
         store.list_files().expect("unchanged retry state"),
-        [unfinished]
+        [unfinished.clone()]
     );
-    assert!(
-        store
-            .load_search_hits(&old_hits)
-            .expect("partial data is hidden")
-            .entities
-            .is_empty()
-    );
-    assert!(
+    let loaded = store
+        .load_search_hits(&old_hits)
+        .expect("surviving data is readable");
+    assert_eq!(loaded.entities[&entities[0].id].entity, entities[0]);
+    assert_eq!(loaded.entities[&entities[0].id].file, unfinished);
+    assert_eq!(
         store
             .read_entity(&entities[0].id)
             .expect("unfinished snapshot")
-            .is_none()
+            .expect("entity")
+            .entity,
+        entities[0]
     );
-    assert!(
+    assert_eq!(
         store
             .search_fts(ContentKind::Text, "orchard", 1, None)
             .expect("unfinished FTS")
-            .is_empty()
+            .len(),
+        1
     );
-    assert!(
+    assert_eq!(
         store
             .search_vector(ContentKind::Text, &entries[1].vector, 1, None)
             .expect("unfinished vectors")
-            .is_empty()
+            .len(),
+        1
     );
     let (_, mut replacement, mut projections) = metadata_fragments(0, "new-owner");
     replacement[0].fragments.truncate(1);
@@ -659,6 +661,14 @@ fn interrupted_deletions_keep_identity_until_retry_finishes() {
     store
         .write(|state| state.files.mark_deleting(source.id))
         .expect("delete intent");
+    let hits = store
+        .search_fts(ContentKind::Text, "orchard", 10, None)
+        .expect("surviving deletion records");
+    let loaded = store
+        .load_search_hits(&hits)
+        .expect("readable pending deletion");
+    assert_eq!(loaded.entities[&entities[0].id].entity, entities[0]);
+    assert_eq!(loaded.entities[&entities[0].id].file, deleting);
     // One collection can be cleared while another still contains old results.
     store
         .write(|state| state.entities.delete_file(source.id))
@@ -673,8 +683,8 @@ fn interrupted_deletions_keep_identity_until_retry_finishes() {
     );
     let hits = store
         .search_fts(ContentKind::Text, "orchard", 10, None)
-        .expect("unfinished deletion is hidden");
-    assert!(hits.is_empty());
+        .expect("projection survives interrupted deletion");
+    assert_eq!(hits.len(), 1);
     assert!(
         store
             .load_search_hits(&hits)

@@ -111,9 +111,9 @@ impl SearchEmbeddingRuntime for Runtime {
 }
 
 struct Fixture {
-    directory: tempfile::TempDir,
-    workspace: Workspace,
     store: IndexStore,
+    workspace: Workspace,
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -142,9 +142,9 @@ impl Fixture {
             updated_epoch_ms: 0,
         };
         Self {
-            directory,
-            workspace,
             store,
+            workspace,
+            directory,
         }
     }
 
@@ -824,7 +824,13 @@ async fn image_query_skips_unsupported_default_paths_but_explicit_target_errors(
         .expect("empty index");
     assert_eq!(
         empty.diagnostics.empty_reason,
-        Some(crate::api::context::result::EmptyReason::NoSearchableFiles)
+        Some(crate::api::context::result::EmptyReason::NoMatches)
+    );
+    assert!(empty.items.is_empty());
+    assert_eq!(
+        text.calls(),
+        vec![(ContentKind::Text, QueryEncoding::Default)],
+        "empty tables follow the normal search path and share query encoding"
     );
     assert!(
         empty
@@ -833,7 +839,7 @@ async fn image_query_skips_unsupported_default_paths_but_explicit_target_errors(
             .expect("diagnostics")
             .targets
             .iter()
-            .all(|target| target.status == IndexTargetStatus::Empty)
+            .all(|target| target.status == IndexTargetStatus::Searched)
     );
 }
 
@@ -880,9 +886,6 @@ async fn failed_target_is_incomplete_in_default_results_and_fails_explicit_reque
 struct CodeVectorFailure<'a>(&'a IndexStore);
 
 impl super::storage::SearchStorage for CodeVectorFailure<'_> {
-    fn entity_counts(&self) -> EngineResult<BTreeMap<ContentKind, u64>> {
-        self.0.entity_counts()
-    }
     fn list_file_paths(&self) -> EngineResult<Vec<(crate::domain::FileId, std::path::PathBuf)>> {
         self.0.list_file_paths()
     }

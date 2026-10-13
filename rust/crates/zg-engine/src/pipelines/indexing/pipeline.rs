@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -218,13 +218,14 @@ pub(crate) async fn index_workspace(
     Ok(result)
 }
 
+// Lightweight refresh checks omit content comparison and per-kind entity counts.
 pub(crate) async fn get_workspace_index_status(
     workspace_index: &Workspace,
     index_home: Option<&Path>,
     storage: &dyn IndexStorage,
     scanner: &dyn WorkspaceScannerPort,
     signal: Option<CancellationToken>,
-    compare_contents: bool,
+    detailed: bool,
 ) -> Result<IndexStats, EngineError> {
     let stored_files = storage.list_files()?;
     crate::file_selection::verify_source_paths(&workspace_index.root, &stored_files)?;
@@ -242,7 +243,7 @@ pub(crate) async fn get_workspace_index_status(
     let (discovered_files, _) =
         classify_files(workspace_index, snapshot.files, &stored_files, &control).await?;
     let mut diff = compute_diff(discovered_files, &stored_files);
-    if compare_contents {
+    if detailed {
         resolve_status_modifications(scanner, &control, &mut diff).await?;
     }
 
@@ -259,7 +260,11 @@ pub(crate) async fn get_workspace_index_status(
         files_scanned: diff.files_scanned,
         files_stored: stored_files.len(),
         files_indexed: indexed_files.len(),
-        entities_by_kind: storage.entity_counts()?,
+        entities_by_kind: if detailed {
+            storage.entity_counts()?
+        } else {
+            BTreeMap::new()
+        },
         entities_indexed: indexed_files
             .iter()
             .map(|file| file.index_status.entity_count())
@@ -2499,6 +2504,7 @@ mod tests {
         entries: Mutex<HashMap<FileId, Vec<IndexedFragment>>>,
         identities: Mutex<HashMap<PathBuf, FileId>>,
         resolved_paths: Mutex<Vec<Vec<PathBuf>>>,
+        entity_count_calls: AtomicUsize,
         finalized: AtomicUsize,
         failed_markers: AtomicUsize,
         fail_replacements_once: Mutex<HashSet<FileId>>,
@@ -2637,6 +2643,7 @@ mod tests {
         }
 
         fn entity_counts(&self) -> EngineResult<std::collections::BTreeMap<ContentKind, u64>> {
+            self.entity_count_calls.fetch_add(1, Ordering::Relaxed);
             let entries = self.entries.lock().expect("entries");
             let mut entities = std::collections::BTreeMap::<ContentKind, HashSet<EntityId>>::new();
             for entry in entries.values().flatten() {
@@ -3819,11 +3826,19 @@ mod tests {
         assert_eq!(model.calls.load(Ordering::Acquire), calls);
 
         std::fs::write(&path, "bravo").expect("same size, different bytes");
+        let refresh = get_workspace_index_status(&workspace, None, &storage, &scanner, None, false)
+            .await
+            .expect("metadata refresh check");
+        assert_eq!(refresh.files_modified, 1);
+        assert!(refresh.entities_by_kind.is_empty());
+        assert_eq!(storage.entity_count_calls.load(Ordering::Relaxed), 0);
         let status = get_workspace_index_status(&workspace, None, &storage, &scanner, None, true)
             .await
             .expect("status");
         assert_eq!(status.files_modified, 1);
         assert_eq!(status.indexed_size_bytes, 5);
+        assert_eq!(status.entities_by_kind.get(&ContentKind::Text), Some(&1));
+        assert_eq!(storage.entity_count_calls.load(Ordering::Relaxed), 1);
         let changed = index_workspace(&context).await.expect("changed bytes");
         assert_eq!(changed.files_modified, 1);
         assert!(model.calls.load(Ordering::Acquire) > calls);
