@@ -1374,12 +1374,12 @@ fn multi_model_file(storage: &IndexStore) -> (FileRecord, Vec<FixtureEntity>) {
     (file, vec![text, image])
 }
 
-fn vector_index_completeness(storage: &IndexStore, model: &str) -> f32 {
+fn vector_index_completeness(storage: &IndexStore, kind: ContentKind) -> f32 {
     storage
         .read(|state| {
             let stats = state
                 .fragments
-                .collection(model)?
+                .collection(kind)?
                 .stats()
                 .expect("native index statistics");
             assert_eq!(stats.indexes.len(), 1);
@@ -1389,18 +1389,35 @@ fn vector_index_completeness(storage: &IndexStore, model: &str) -> f32 {
 }
 
 #[test]
-fn finalization_builds_every_model_index_in_reopened_flush_only_storage() {
+fn finalization_builds_every_kind_index_in_reopened_flush_only_storage() {
     let home = tempfile::tempdir().expect("workspace");
-    let writer = open_multi_model(home.path());
-    let (file, entries) = multi_model_file(&writer);
+    let mut tables = multi_model_schema();
+    tables.push(ContentIndex {
+        kind: ContentKind::Code,
+        embedding: tables[0].embedding.clone(),
+    });
+    let options = || WorkspaceIndexStorageOptions::ReadWrite {
+        storage_path: home.path().to_owned(),
+        tables: tables.clone(),
+    };
+    let writer = IndexStore::open(options()).expect("three-kind storage");
+    let (file, mut entries) = multi_model_file(&writer);
+    let mut code = entries[0].clone();
+    code.kind = ContentKind::Code;
+    code.entity.content = Content::Code("orchard code".into());
+    code.entity.id = EntityId::new(file.id, &code.entity.content, code.entity.source_range)
+        .expect("code entity id");
+    code.entity.fragments[0].id = FragmentId::new(&code.entity.id, 0);
+    code.fts_text = "orchard code".into();
+    entries.push(code);
     writer
         .replace_fixture_file(&file, &entries)
         .expect("complete file");
     writer.close().expect("flush without optimizing");
 
-    let writer = open_multi_model(home.path());
+    let writer = IndexStore::open(options()).expect("reopened three-kind storage");
     for entry in &entries {
-        assert!(vector_index_completeness(&writer, &entry.model) < 1.0);
+        assert!(vector_index_completeness(&writer, entry.kind) < 1.0);
     }
     writer.finalize_writes().expect("finish existing indexes");
     writer.finalize_writes().expect("unchanged finalization");
@@ -1408,14 +1425,27 @@ fn finalization_builds_every_model_index_in_reopened_flush_only_storage() {
 
     let reader = open(home.path(), true);
     for entry in &entries {
-        assert!(vector_index_completeness(&reader, &entry.model) >= 1.0);
+        assert!(vector_index_completeness(&reader, entry.kind) >= 1.0);
         let hits = reader
-            .search_vector(&entry.model, &entry.vector, 10, None)
-            .expect("optimized model retrieval");
+            .search_vector(entry.kind, &entry.vector, 10, None)
+            .expect("optimized kind retrieval");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document_id, entry.entity.fragments[0].id.as_str());
     }
-    assert_eq!(reader.search_fts("name", 10, None).expect("FTS").len(), 2);
+    for kind in [ContentKind::Text, ContentKind::Code] {
+        assert_eq!(
+            reader
+                .search_fts(kind, "orchard", 10, None)
+                .expect("FTS")
+                .len(),
+            1
+        );
+    }
+    assert!(
+        reader
+            .search_fts(ContentKind::Image, "name", 10, None)
+            .is_err()
+    );
     reader.close().expect("close reader");
 }
 
@@ -1441,22 +1471,22 @@ fn finalization_preserves_replacements_and_deletions_after_reopen() {
     writer.close().expect("close writer");
 
     let reader = open(home.path(), true);
-    assert!(vector_index_completeness(&reader, "fixture/fixture-model") >= 1.0);
+    assert!(vector_index_completeness(&reader, ContentKind::Text) >= 1.0);
     for removed in ["orchard", "vineyard"] {
         assert!(
             reader
-                .search_fts(removed, 10, None)
+                .search_fts(ContentKind::Text, removed, 10, None)
                 .expect("removed FTS")
                 .is_empty()
         );
     }
     let hits = reader
-        .search_fts("meadow", 10, None)
+        .search_fts(ContentKind::Text, "meadow", 10, None)
         .expect("replacement FTS");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].file_id, first.id);
     let vectors = reader
-        .search_vector("fixture/fixture-model", &[0.0, 0.0, 1.0], 10, None)
+        .search_vector(ContentKind::Text, &[0.0, 0.0, 1.0], 10, None)
         .expect("replacement vector");
     assert_eq!(vectors.len(), 1);
     assert_eq!(vectors[0].document_id, hits[0].document_id);

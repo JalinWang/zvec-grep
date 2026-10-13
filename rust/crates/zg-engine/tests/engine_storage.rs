@@ -155,7 +155,7 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
             .index_version,
         Some(2)
     );
-    let collections = model_collections(&info.index_path)?;
+    let collections = kind_collections(&info.index_path)?;
     assert_eq!(collections.len(), 2);
     assert_vector_indexes_complete(&info.index_path)?;
     assert_eq!(native_documents(&info.index_path.join("text"))?.len(), 1);
@@ -284,7 +284,7 @@ async fn image_routes_partition_search_and_preserve_content_across_reopen() -> T
             .len(),
         3
     );
-    assert_eq!(model_collections(&info.index_path)?.len(), 3);
+    assert_eq!(kind_collections(&info.index_path)?.len(), 3);
     for reopened in [false, true] {
         if reopened {
             engine.close();
@@ -548,7 +548,7 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
     }
     assert!(coverage.into_iter().all(|covered| covered));
     assert_eq!(server.inputs.load(Ordering::Acquire), fragments.len());
-    let collections = model_collections(&info.index_path)?;
+    let collections = kind_collections(&info.index_path)?;
     assert_eq!(collections.len(), 2);
     let projected = native_documents(&info.index_path.join("code"))?;
     assert_eq!(projected.len(), fragments.len());
@@ -1725,7 +1725,7 @@ async fn fts_paths(
     Ok(paths)
 }
 
-fn model_collections(index_path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn kind_collections(index_path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     Ok(fs::read_dir(index_path)?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -1740,7 +1740,8 @@ fn model_collections(index_path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::err
 }
 
 fn assert_vector_indexes_complete(index_path: &Path) -> TestResult {
-    for path in model_collections(index_path)? {
+    let mut populated_tables = 0;
+    for path in kind_collections(index_path)? {
         #[cfg(windows)]
         let path = dunce::simplified(&path);
         let mut options = zvec_rust::CollectionOptions::new()?;
@@ -1750,13 +1751,16 @@ fn assert_vector_indexes_complete(index_path: &Path) -> TestResult {
             Some(&options),
         )?;
         let stats = collection.stats()?;
-        assert!(stats.doc_count > 0);
-        assert_eq!(stats.indexes.len(), 1);
-        assert!(
-            stats.indexes[0].completeness >= 1.0,
-            "default indexing must finish the vector index: {stats:?}"
-        );
+        if stats.doc_count > 0 {
+            populated_tables += 1;
+            assert_eq!(stats.indexes.len(), 1);
+            assert!(
+                stats.indexes[0].completeness >= 1.0,
+                "default indexing must finish the vector index: {stats:?}"
+            );
+        }
         collection.close()?;
     }
+    assert!(populated_tables > 0);
     Ok(())
 }
