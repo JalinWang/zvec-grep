@@ -25,6 +25,7 @@ impl Fixture {
             .env("USERPROFILE", self.user.path())
             .env("ZVEC_GREP_HOME", self.user.path().join("runtime"));
         for key in [
+            "ZVEC_GREP_INDEX_DIR",
             "ZVEC_GREP_CONFIG",
             "ZVEC_GREP_DEVICE",
             "ZVEC_GREP_EMBEDDING",
@@ -344,10 +345,9 @@ fn config_merges_settings_and_index_consumes_model_defaults() {
         manifest["defaultEmbeddingModel"]["model"]["name"],
         "potion-code-16m-v2"
     );
-    assert_eq!(
-        manifest["embeddingRuntimes"]["local/potion-code-16m-v2"]["device"],
-        "cpu"
-    );
+    let runtime = &manifest["embeddingRuntimes"]["local/potion-code-16m-v2"];
+    assert!(runtime.get("device").is_none());
+    assert!(runtime.get("cacheDir").is_none());
     let status = fixture.success(&["--status", "--mode", "direct"]);
     assert!(
         String::from_utf8_lossy(&status.stdout)
@@ -624,4 +624,54 @@ fn workspace_credentials_follow_explicit_source_and_global_home_is_optional() {
     assert!(output.contains("rebuild_required"));
     assert!(!output.contains("legacy-secret-do-not-log"));
     assert!(!String::from_utf8_lossy(&status.stderr).contains("legacy-secret-do-not-log"));
+}
+
+#[test]
+fn index_directory_cli_overrides_environment_and_default() {
+    let fixture = Fixture::new();
+    for (args, environment, directory) in [
+        (
+            vec!["--status", "--mode", "direct", "--json"],
+            None,
+            fixture.root.path().join(".zvec-grep"),
+        ),
+        (
+            vec!["--status", "--mode", "direct", "--json"],
+            Some("environment-index"),
+            fixture.root.path().join("environment-index"),
+        ),
+        (
+            vec![
+                "--status",
+                "--mode",
+                "direct",
+                "--json",
+                "--index-dir",
+                "explicit-index",
+            ],
+            Some("environment-index"),
+            fixture.root.path().join("explicit-index"),
+        ),
+    ] {
+        let mut command = fixture.command(&args);
+        if let Some(value) = environment {
+            command.env("ZVEC_GREP_INDEX_DIR", value);
+        }
+        let output = command.output().expect("status");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON status");
+        let canonical_root = fixture.root.path().canonicalize().expect("root");
+        assert_eq!(
+            info["home"],
+            json!(canonical_root.join(directory.file_name().expect("directory name")))
+        );
+        assert!(
+            !directory.exists(),
+            "read-only status must not create an index"
+        );
+    }
 }

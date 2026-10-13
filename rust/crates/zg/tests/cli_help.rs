@@ -69,7 +69,12 @@ fn search_help_describes_terminal_and_compact_defaults() {
     assert!(help.contains("--input"));
     assert!(help.contains("--kind"));
     assert!(!help.contains("--query-image"));
+    assert!(!help.contains("--root"));
+    assert!(!zg(&["needle", "--root", "."]).status.success());
     assert!(help.contains("full on TTY, none in compact mode"));
+    assert!(help.contains("All text/code searches apply rule ranking"));
+    assert!(help.contains("approximate BM25"));
+    assert!(help.contains("within each compatible result group"));
     assert!(!help.contains("--human"));
     assert!(!help.contains("zg query"));
 }

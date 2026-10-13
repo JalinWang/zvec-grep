@@ -22,7 +22,8 @@ use crate::{
 };
 
 use super::pipeline::{
-    SearchEmbeddingRuntime, SearchHit, SearchPlan, SearchPlanResult, search_workspace_index,
+    RecalledSearch, SearchEmbeddingRuntime, SearchHit, SearchPlan, SearchPlanResult,
+    recall_workspace_index,
 };
 
 const DEFAULT_CONTEXT_TOTAL_LIMIT: usize = 30;
@@ -183,22 +184,8 @@ pub(crate) async fn context_from_index(
         .map(|model| super::pipeline::CachedSearchRuntime::new(*model))
         .collect::<Vec<_>>();
     let mut targets_diagnostics = Vec::new();
-    let mut bundles = Vec::new();
-    let mut result = ContextResult {
-        freshness: None,
-        background_refresh: None,
-        query: request.display_query.clone(),
-        root: root.to_path_buf(),
-        source: ContextSource::Index,
-        coverage: ContextCoverage::RankedSample,
-        workspace_index: Some(ContextWorkspaceIndex {
-            name: workspace.name.clone(),
-            path: workspace_home.to_path_buf(),
-        }),
-        items: Vec::new(),
-        group_results: Vec::new(),
-        diagnostics: build_table_result(&workspace.root, request, &groups, Vec::new())?.diagnostics,
-    };
+    let mut recalls = Vec::new();
+    let mut result = empty_index_context(root, workspace, workspace_home, request, &groups)?;
     let mut first_error = None;
     for target in targets {
         let model_ref = target.schema.model().reference();
@@ -244,19 +231,30 @@ pub(crate) async fn context_from_index(
         if empty {
             diagnostic.status = IndexTargetStatus::Empty;
         }
-        let table_result =
-            build_table_result(&workspace.root, request, &recall.groups, recall.searches)?;
-        let compatible = groups.len() == 1 && groups[0].routes.len() == 1;
-        append_table_result(
-            &mut result,
-            &mut bundles,
-            &target,
-            recall.query_encoding,
-            recall.scoring,
-            compatible,
-            table_result,
-        );
+        pool_table_recall(&mut recalls, recall);
         targets_diagnostics.push(diagnostic);
+    }
+    let mut bundles = Vec::new();
+    for recall in recalls {
+        let kinds = recall.kinds.clone();
+        let finished = finish_table_recall(recall, &workspace.root, request, storage);
+        match finished {
+            Ok((group, table_result)) => {
+                append_table_result(&mut result, &mut bundles, group, table_result);
+            }
+            Err(error) => {
+                if options.target_kind.is_some() || error.code() == EngineError::CANCELLED {
+                    return Err(error);
+                }
+                for diagnostic in &mut targets_diagnostics {
+                    if kinds.contains(&diagnostic.kind) {
+                        diagnostic.status = IndexTargetStatus::Failed;
+                        diagnostic.reason = Some(error.message().to_owned());
+                    }
+                }
+                first_error.get_or_insert(error);
+            }
+        }
     }
     if bundles.is_empty()
         && let Some(error) = first_error
@@ -269,6 +267,30 @@ pub(crate) async fn context_from_index(
         targets_diagnostics,
         limit,
     ))
+}
+
+fn empty_index_context(
+    root: &Path,
+    workspace: &Workspace,
+    workspace_home: &Path,
+    request: &NormalizedContextRequest,
+    groups: &[NormalizedContextGroup],
+) -> Result<ContextResult, EngineError> {
+    Ok(ContextResult {
+        freshness: None,
+        background_refresh: None,
+        query: request.display_query.clone(),
+        root: root.to_path_buf(),
+        source: ContextSource::Index,
+        coverage: ContextCoverage::RankedSample,
+        workspace_index: Some(ContextWorkspaceIndex {
+            name: workspace.name.clone(),
+            path: workspace_home.to_path_buf(),
+        }),
+        items: Vec::new(),
+        group_results: Vec::new(),
+        diagnostics: build_table_result(&workspace.root, request, groups, Vec::new())?.diagnostics,
+    })
 }
 
 fn query_groups(
@@ -288,10 +310,13 @@ fn query_groups(
 }
 
 struct TableRecall {
+    schema: crate::domain::EmbeddingModelInfo,
+    kinds: Vec<ContentKind>,
+    model_refs: Vec<String>,
     query_encoding: Option<QueryEncoding>,
     groups: Vec<NormalizedContextGroup>,
     scoring: IndexScoring,
-    searches: Vec<SearchPlanResult>,
+    searches: Vec<RecalledSearch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -309,9 +334,17 @@ async fn recall_table(
     let prefer_symbol = options.prefer_symbol && target.kind == ContentKind::Code;
     let scoring = table_scoring(&groups, prefer_symbol);
     let model_ref = target.schema.model().reference();
-    let runtime = cached
+    let uses_vectors = groups
         .iter()
-        .find(|runtime| runtime.info().model().reference() == model_ref);
+        .flat_map(|group| &group.routes)
+        .any(|route| route.mode == ContextRouteMode::Vector);
+    let runtime = uses_vectors
+        .then(|| {
+            cached
+                .iter()
+                .find(|runtime| runtime.info().model().reference() == model_ref)
+        })
+        .flatten();
     let searches = recall_target(
         root,
         SearchPlan {
@@ -332,9 +365,24 @@ async fn recall_table(
     .await?;
     let query_encoding = runtime
         .filter(|runtime| runtime.has_pinned_weights())
-        .and_then(|_| searches.first())
-        .and_then(|search| search.query_encoding);
+        .map(|runtime| {
+            if let Some(encoding) = searches.first().and_then(|search| search.query_encoding) {
+                return Ok(encoding);
+            }
+            let input = if request.image.is_some() {
+                ContentKind::Image
+            } else {
+                ContentKind::Text
+            };
+            runtime
+                .query_encoding(input, target.kind)
+                .map_err(crate::models::ModelError::into_engine_error)
+        })
+        .transpose()?;
     Ok(TableRecall {
+        schema: target.schema.clone(),
+        kinds: vec![target.kind],
+        model_refs: vec![target.schema.model().reference()],
         query_encoding,
         groups,
         scoring,
@@ -354,8 +402,6 @@ struct TableContextResult {
 }
 
 struct RankedResultGroup {
-    schema: crate::domain::EmbeddingModelInfo,
-    query_encoding: Option<QueryEncoding>,
     group: IndexResultGroup,
     items: Vec<IndexedContextItem>,
 }
@@ -398,7 +444,7 @@ async fn recall_target(
     storage: &dyn SearchStorage,
     runtime: Option<&super::pipeline::CachedSearchRuntime<'_>>,
     empty: bool,
-) -> Result<Vec<SearchPlanResult>, EngineError> {
+) -> Result<Vec<RecalledSearch>, EngineError> {
     if let Some(runtime) = runtime {
         runtime.ensure_available()?;
     }
@@ -412,66 +458,77 @@ async fn recall_target(
     for group in groups {
         let mut plan = plan.clone();
         plan.routes.clone_from(&group.routes);
-        searches.push(search_workspace_index(root, plan, storage, &runtimes).await?);
+        searches.push(recall_workspace_index(root, plan, storage, &runtimes).await?);
     }
     Ok(searches)
 }
 
-fn merge_table_items(
-    bundles: &mut Vec<RankedResultGroup>,
-    target: &super::service::QueryTarget<'_>,
-    query_encoding: Option<QueryEncoding>,
-    scoring: IndexScoring,
-    compatible: bool,
-    mut items: Vec<IndexedContextItem>,
-) {
-    let model_ref = target.schema.model().reference();
-    if let Some(existing) = bundles.iter_mut().find(|existing| {
-        compatible
-            && existing.group.scoring == IndexScoring::Vector
-            && query_encoding.is_some()
-            && query_encoding == existing.query_encoding
-            && target.schema.model().reference() == existing.schema.model().reference()
-            && target.schema.dimension() == existing.schema.dimension()
-            && target.schema.metric() == existing.schema.metric()
-    }) {
-        existing.group.kinds.push(target.kind);
-        if !existing.group.model_refs.contains(&model_ref) {
-            existing.group.model_refs.push(model_ref);
+fn pool_table_recall(pools: &mut Vec<TableRecall>, mut next: TableRecall) {
+    let uses_vectors = next
+        .groups
+        .iter()
+        .flat_map(|group| &group.routes)
+        .any(|route| route.mode == ContextRouteMode::Vector);
+    let pool = pools.iter_mut().find(|pool| {
+        !pool.kinds.contains(&ContentKind::Image)
+            && !next.kinds.contains(&ContentKind::Image)
+            && (!uses_vectors
+                || (next.query_encoding.is_some()
+                    && next.query_encoding == pool.query_encoding
+                    && next.schema.model().reference() == pool.schema.model().reference()
+                    && next.schema.dimension() == pool.schema.dimension()
+                    && next.schema.metric() == pool.schema.metric()))
+    });
+    if let Some(pool) = pool {
+        pool.kinds.append(&mut next.kinds);
+        for model in next.model_refs {
+            if !pool.model_refs.contains(&model) {
+                pool.model_refs.push(model);
+            }
         }
-        existing.items.append(&mut items);
-        existing.items.sort_by(|a, b| {
-            b.item
-                .score
-                .unwrap_or(0.0)
-                .total_cmp(&a.item.score.unwrap_or(0.0))
-                .then_with(|| a.item.relative_path.cmp(&b.item.relative_path))
-                .then_with(|| a.entity_id.cmp(&b.entity_id))
-        });
+        if next.scoring == IndexScoring::Hybrid {
+            pool.scoring = IndexScoring::Hybrid;
+        }
+        if pool.searches.is_empty() {
+            pool.searches = next.searches;
+        } else {
+            for (existing, search) in pool.searches.iter_mut().zip(next.searches) {
+                existing.merge(search);
+            }
+        }
     } else {
-        bundles.push(RankedResultGroup {
-            schema: target.schema.clone(),
-            query_encoding,
-            group: IndexResultGroup {
-                id: target.kind.as_str().to_owned(),
-                kinds: vec![target.kind],
-                model_refs: vec![model_ref],
-                scoring,
-                item_start: 0,
-                item_count: 0,
-            },
-            items,
-        });
+        pools.push(next);
     }
+}
+
+fn finish_table_recall(
+    recall: TableRecall,
+    root: &Path,
+    request: &NormalizedContextRequest,
+    storage: &dyn SearchStorage,
+) -> Result<(IndexResultGroup, TableContextResult), EngineError> {
+    let searches = recall
+        .searches
+        .into_iter()
+        .map(|search| search.finish(storage))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = build_table_result(root, request, &recall.groups, searches)?;
+    let group = IndexResultGroup {
+        id: recall.kinds[0].as_str().to_owned(),
+        rule_ranking: !recall.kinds.contains(&ContentKind::Image),
+        kinds: recall.kinds,
+        model_refs: recall.model_refs,
+        scoring: recall.scoring,
+        item_start: 0,
+        item_count: 0,
+    };
+    Ok((group, result))
 }
 
 fn append_table_result(
     result: &mut ContextResult,
     bundles: &mut Vec<RankedResultGroup>,
-    target: &super::service::QueryTarget<'_>,
-    query_encoding: Option<QueryEncoding>,
-    scoring: IndexScoring,
-    compatible: bool,
+    group: IndexResultGroup,
     table_result: TableContextResult,
 ) {
     result
@@ -487,14 +544,10 @@ fn append_table_result(
             .routes
             .extend(index.routes);
     }
-    merge_table_items(
-        bundles,
-        target,
-        query_encoding,
-        scoring,
-        compatible && scoring == IndexScoring::Vector,
-        table_result.items,
-    );
+    bundles.push(RankedResultGroup {
+        group,
+        items: table_result.items,
+    });
 }
 
 fn finish_context_result(
@@ -1033,7 +1086,6 @@ mod tests {
         let file_id = FileId::new(1);
         let id = EntityId::new(file_id, &content, Range::Full).expect("id");
         let search = SearchPlanResult {
-            query_encoding: None,
             routes: vec![],
             timings: vec![],
             hits: vec![SearchHit {
@@ -1207,7 +1259,6 @@ mod tests {
 
     fn context_item_for_hit(hit: &super::SearchHit) -> ContextItem {
         let search = super::SearchPlanResult {
-            query_encoding: None,
             routes: Vec::new(),
             hits: vec![hit.clone()],
             timings: Vec::new(),
@@ -1341,7 +1392,6 @@ mod tests {
         );
         let content = Content::Text(content.to_owned());
         let search = SearchPlanResult {
-            query_encoding: None,
             routes: Vec::new(),
             hits: vec![SearchHit {
                 entity: Entity {

@@ -4,73 +4,63 @@
 
 ## Usage
 
-Work in progress. Usage examples will be added once the engine is stable.
+Reuse one `ZvecGrep` instance across requests and workspaces. Call its async methods from a Tokio runtime. This example indexes the current directory using the configured embedding model, then searches it:
+
+```rust
+use zg_engine::{
+    ZvecGrep,
+    api::{context::ContextOptions, index::IndexOptions},
+};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::env::current_dir()?;
+    let engine = ZvecGrep::new();
+
+    engine
+        .index(IndexOptions {
+            root: Some(root.clone()),
+            ..IndexOptions::default()
+        })
+        .await?;
+
+    let results = engine
+        .context(ContextOptions {
+            root: Some(root),
+            query: Some("where is authentication handled?".into()),
+            limit: Some(5),
+            ..ContextOptions::default()
+        })
+        .await?;
+
+    for item in results.items {
+        println!("{}", item.relative_path.display());
+    }
+
+    engine.close();
+    Ok(())
+}
+```
+
+Use `IndexOptions::embedding` and `embedding_routes` to select models. `ContextOptions::query_image` accepts image input, and `target_kind` limits the content kind searched. The engine also provides `info` for workspace status and `drop_index` to remove an index. See the [Rust README](../../README.md) for build setup.
 
 ## Behavior
 
-**Generated files.** Each workspace keeps its state under `.zvec-grep` in the source root:
+**Source files.** Source files remain untouched. The engine indexes content extracted from supported files. Users can optionally configure scan rules to select files for indexing and query filters to narrow results.
 
-- `manifest.json` stores workspace configuration and identifies the active index.
-- `credentials.key` is created when an explicit indexing API key is saved; the manifest stores only encrypted credentials.
-- `index/` holds the current index. Rebuilds stage data under `temp/`, with `temp/build.json` coordinating publication and recovery; generation IDs remain manifest metadata.
-- `authorization.json` stores saved consent for remote embedding services, when granted.
+**Workspace data.** The default data directory is `<source>/.zvec-grep`. Set `index_dir` on index, context, info and drop options to select another complete data directory. Its manifest stores `sourceRoot` relative to that directory; existing-index queries resolve the saved relationship rather than replacing it with the request's discovery root. Explicit directories never fall back to another index. The data directory holds `manifest.json`, `index/`, temporary build state and locks. Close writers and watchers before copying it together with the source files, preserving the relative layout. Reopening then resolves the destination source root automatically. Different Windows drives cannot form this relative relationship and are rejected. Changing the layout requires explicitly indexing the new source root to repair the relationship. Indexed queries fail when that source is unavailable; `rg` searches remain independent of index configuration. Relative file paths use portable components, and filenames must be representable without collisions on the destination filesystem. Source files can be read-only; the data directory must be writable. This directory can also contain encrypted saved credentials, whose decryption key travels with it; remote consent still requires authorization on the destination machine.
 
-Per-user files are optional: `~/.zvec-grep/workspaces.json` caches workspace names and locations, and `~/.zvec-grep/config.json` supplies defaults and credentials when present. Workspace operations do not require this registry or a global home directory. Saved remote consent uses a machine-local signing key at `~/.zvec-grep/authorization.key` by default. A different machine or workspace location requires fresh consent; saved API keys remain usable. Without a global home, use per-invocation consent instead of a saved grant. Lock and recovery files are managed automatically.
+**Shared configuration and models.** Global defaults and credentials come from `~/.zvec-grep/config.json`; `workspaces.json` is an optional workspace discovery cache. Local models download missing files on first use. On macOS and Linux, their default cache is `~/.zvec-grep/models`; set `ZVEC_GREP_MODEL_CACHE` to change it. Device and model cache settings are local runtime choices (request, environment, local configuration, then default); they are not saved in the index. Remote models send content to their configured service and require credentials and authorization.
 
-**Models.** Local models download missing assets on first use and process content locally. On macOS and Linux, the default model cache is `~/.zvec-grep/models`. Set `ZVEC_GREP_MODEL_CACHE` to choose a cache directory. Remote models send content or queries to the configured embedding endpoint and require authorization.
+**Model routing.** Each enabled content kind uses one embedding model, selected through a workspace default and optional overrides. Content unsupported by the default model is skipped; an unsupported explicit route is an error.
 
-**Storage and embedding.** Each generation contains shared `directories`, `files` and `entities` collections, plus one retrieval table per enabled content kind (text, code, image). Each table binds one embedding model; kinds stay physically separate even when they share the same runtime. Each entity stores one complete source content object, its source location, metadata, and its fragments. A fragment has its own ID and one range relative to its entity's content. Its source location is calculated from that range and the entity's source location; it stores neither a second content payload nor duplicate source coordinates. Short entities use one full-content fragment, and long entities use source slices that preserve headers, delimiters, and whitespace. Metadata remains attached to the entity and is projected into FTS and embedding inputs; supported metadata filters have dedicated index fields.
+**Search.** Text and code support full-text and vector search; images support vector search. Queries can target one content kind or search all enabled kinds supported for that input. Results contain paths and previews, with separate ranking groups where needed. The result limit applies across groups.
 
-Entities and fragments use the same `Range` type. An entity's `source_range` is relative to its file; text source locations include decoded UTF-8 byte offsets, one-based line numbers, and zero-based byte columns. A text fragment's `range` selects full content or a half-open UTF-8 byte span relative to its entity's content. Fragment line and column numbers are computed when source locations are needed. Images can only use full-content fragments; raw byte source locations remain available independently.
-
-Ranges validate their coordinates during construction, including when decoded from storage. `Range::contains` compares ranges of the same kind and returns an error for different kinds; callers provide ranges from the same source and coordinate space. Index preparation and query result assembly select fragment content, using shared text utilities for slicing and source coordinates. `Entity::validate` checks an entity's content and fragments at the storage write boundary and after decoding. The storage write boundary also checks file ownership and ID uniqueness across entities. Extraction checks fragment content rules; later slicing retains UTF-8 bounds checks.
-
-Entity IDs are 32 lowercase hexadecimal characters: an eight-character file ID followed by the first 96 bits of SHA-256 over JSON-serialized content and source range. Fragment IDs append an eight-character ordinal to their entity ID, giving 40 characters. Storage uses these IDs directly as keys and fields without another hash or hexadecimal encoding. Direct lexical searches return structural container ranges and metadata with no entity ID because they do not resolve stored entities.
-
-Whitespace-only ranges remain in the complete entity content without creating search fragments. Every non-whitespace part of an extracted entity, including braces and punctuation, remains covered by its fragments.
-
-Select the default model with `zg --index --embedding <model>` and override a kind
-with another `--embedding image=local/embeddinggemma-2`. Use
-`--embedding image=default` to remove that override and inherit the workspace
-default; omitted settings keep their saved values. Defaults that cannot index a
-kind skip it; unsupported explicit model choices fail. Text/code tables have full-text
-and vector indexes; image tables have vectors only. Standalone PNG, JPEG and static
-WebP snapshots are supported. Effective model/encoding changes require `--rebuild`.
-Remote destinations require consent as usual.
-
-Queries retain their input kind and can select a target using `--kind`.
-The CLI accepts literal text or a single `--input <path>` file (PNG, JPEG or static
-WebP); positional text is never interpreted as a file input automatically.
-Without a target, all configured compatible tables participate. Identical model
-and query encoding configurations reuse the query vector. Only compatible pure
-vector scores may share a ranked group; other results retain independent kind
-rankings. The total result limit (1–2000, default 30) is shared round-robin across
-groups. Structured
-results expose paths, previews, target outcomes, grouping and incomplete searches. Generation and entity IDs stay internal; no public snapshot-reading operation is exposed.
-
-**Index compatibility.** `indexVersion` is the single version for persisted workspace configuration, storage layout, and record encoding. The current Rust format is version 2; Node.js indexes use version 1. Search, incremental indexing, and watching require the current version. Status reports `rebuild_required` with the actual and expected versions when existing data is incompatible, including a missing version or invalid current-format metadata. Status inspection does not open incompatible storage. There are no separate manifest, storage-schema, or record-codec version counters. Storage generation UUIDs select published data and do not describe compatibility.
-
-**Index updates.** Repeated indexing reuses unchanged files, updates changed files, and removes deleted files from the index. Unsupported files are skipped. A failed file keeps its path and error but loses all searchable records; the next index retries the whole file. `drop_index` removes index data, workspace configuration, saved credentials, and the optional discovery entry while preserving source files and shared model caches.
-
-**Workspace names.** Names are descriptive labels saved in the manifest; new workspaces default to the root directory's name. Use `IndexOptions::name` to choose or change a name. Different roots may share a name. Move or copy the source root together with `.zvec-grep`; reads resolve paths against its new location. A registry entry never overrides the workspace's configuration.
-
-**Credentials.** Indexing explicitly supplied API keys are encrypted in the manifest; environment and global configuration keys are not persisted. Query-only keys remain temporary. Ciphertexts are authenticated and bound to the model reference. The random per-workspace encryption key is stored separately in `credentials.key` (mode 0600 on Unix), so a full workspace copy retains credentials. This prevents plaintext exposure, not access by someone holding both files. Failed or cancelled index operations preserve the active manifest's credentials. API keys and consent to send data to a remote endpoint remain separate.
-
-**Rebuilds and recovery.** An incompatible index format requires an explicit rebuild with `IndexOptions::rebuild` or `zg --index --rebuild`. Rebuilding an incompatible index uses an explicitly supplied embedding model or the configured default; it does not migrate the old configuration or reuse its stored model. Supply any desired scan settings again. Prior Rust development formats are not migrated. Every rebuild starts from empty storage. Individual file failures are recorded with paths and reasons; successful files are still published. Cancellation or a storage/finalization failure discards the build and preserves the previous active index. Ordinary `index` updates the active index, or builds a new one if none exists. Crash recovery discards unpublished storage or finishes cleanup after publication; it never resumes a build. Explicit drop remains available when persisted metadata cannot be decoded.
-
-File writes record `NotIndexed` before replacing indexed content and `Indexed` on completion. Deletes record `Deleting` until related data is removed. Interrupted operations are retried by the next indexing run, including scoped updates; opening and searching do not retry unfinished file updates. Search may return intermediate results and skips missing references. No `pending.json` is created.
-
-**File selection.** Indexing and indexed queries share ordered glob rules. Format and category filters apply only to queries and compile the catalog's filename rules into storage predicates. Extensions and special filenames match exactly as registered: Rust includes `.rs`, while JPEG explicitly includes both `.jpeg` and `.JPEG`; other case variants are not inferred. The longest registered extension takes precedence, and special filenames add format matches (specific formats suppress generic Text). `-g` and `--iglob` retain their order; the last matching rule wins, subject to excluded parent directories. `-t` / `-T` select or exclude engine formats, and `--category` / `--category-not` select or exclude categories such as `code`, `document`, and `image`. Each include list uses any-match semantics; path, format, and category constraints must all match, and format/category exclusions take precedence. HTML, for example, belongs to both code and document, so excluding document also excludes HTML.
-
-Workspace scan rules determine index membership. Query filters only narrow the stored corpus and never modify workspace settings or read source files to identify their formats. The `--rg` path remains independent and uses ripgrep's own glob, type, ignore, and traversal behavior. Scanning options on an indexed query are rejected instead of silently ignored.
-
-Indexing can inspect content to choose an extractor, but file records do not persist detected formats. An extensionless Python script can therefore be indexed as code while its file name does not match a Python query filter. The file-format catalog includes non-text formats for classification; recognizing a format does not imply that this version can index it.
-
-Index requests update only supplied scan-rule fields: an empty list clears a list, `false` disables a flag, and JSON `null` removes a depth or size limit. The CLI accepts `--hidden=false`, `--no-ignore=false`, and `--follow=false`; `--reset-paths` resets all saved selection settings before applying the request. A selection update always reconciles the full workspace.
-
-Nested Git repositories and checked-out submodules are scanned by default, subject to the same ignore rules as other directories. Set `--nested-git=false` (`scan.nested_git: false` in the SDK, `nestedGit: false` in MCP) to prune child directories containing a `.git` file or directory. This boundary also applies with `--no-ignore` and explicit globs. `--nested-git` enables traversal again; omitted updates retain the saved setting, and reset restores the default. The workspace root itself is never treated as nested. `.git` and `.zvec-grep` metadata remain excluded in either mode. To traverse an otherwise ignored directory, use `--no-ignore` or explicitly include both the directory and its descendants, for example `-g nested -g 'nested/**'`.
+**Index lifecycle.** Repeated indexing updates changed files, reuses unchanged files, and removes deleted files. Failed files are reported and excluded from search until successfully indexed. Changing an index's embedding model or using an incompatible index format requires an explicit rebuild. A cancelled or aborted rebuild preserves the previous index. Dropping an index removes workspace settings and index data while preserving source files and shared model caches.
 
 ## Modules
+
+The source code is organized into the following modules:
 
 - **API** defines public request and result types.
 - **Service** connects engine capabilities behind `ZvecGrep`.

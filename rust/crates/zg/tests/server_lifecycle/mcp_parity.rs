@@ -17,14 +17,125 @@ fn multimodal_targets_and_groups_survive_direct_server_and_mcp() -> Result<(), B
         configure_multimodal_command(command, &home, &workspace);
     })?;
     let port = guard.listen.parse::<SocketAddr>()?.port();
-    for query in [
-        &["--vector", "orchard"][..],
-        &["--input", "picture.png"][..],
+    for (query, mcp_query) in [
+        (&["--vector", "orchard"][..], json!({"vector":"orchard"})),
+        (&["orchard"][..], json!({"query":"orchard"})),
+        (&["--fts", "orchard"][..], json!({"fts":"orchard"})),
+        (
+            &["--fts", "orchard", "--vector", "fruit"][..],
+            json!({"fts":"orchard", "vector":"fruit"}),
+        ),
+        (
+            &["--fts", "orchard", "--vector", "fruit", "--fuse"][..],
+            json!({"fts":"orchard", "vector":"fruit", "fuse":true}),
+        ),
+        (
+            &["--input", "picture.png"][..],
+            json!({"queryImage":{"source":"path", "path":workspace.path().join("picture.png").canonicalize()?}}),
+        ),
     ] {
-        check_multimodal_queries(&binary, &home, &workspace, port, query)?;
+        check_multimodal_queries(&binary, &home, &workspace, port, query, &mcp_query)?;
     }
+    check_merged_cli_trace(&binary, &home, &workspace)?;
+    check_multimodal_errors(&binary, &home, &workspace, port, &embedding)?;
     check_embedding_inheritance(&binary, &home, &workspace, embedding.address)?;
+    check_independent_index_directories(&binary, &home, &workspace, port, embedding.address)?;
     assert_command_success(&guard.stop()?);
+    Ok(())
+}
+
+fn check_multimodal_errors(
+    binary: &Path,
+    home: &TempDir,
+    workspace: &TempDir,
+    port: u16,
+    embedding: &EmbeddingServer,
+) -> Result<(), Box<dyn Error>> {
+    for (route, expected_message, fail) in [
+        (
+            "--fts",
+            "image tables do not support full-text search",
+            false,
+        ),
+        ("--vector", "401", true),
+    ] {
+        embedding.fail.store(fail, Ordering::Release);
+        for mode in ["direct", "server"] {
+            let mut command = Command::new(binary);
+            configure_multimodal_command(&mut command, home, workspace);
+            let output = command
+                .args([
+                    route,
+                    "unavailable image query",
+                    "--kind",
+                    "image",
+                    "--mode",
+                    mode,
+                    "--refresh",
+                    "off",
+                    "--json",
+                ])
+                .output()?;
+            assert!(!output.status.success(), "failed search must not succeed");
+            assert!(
+                output.stdout.is_empty(),
+                "failed search must not emit a JSON success"
+            );
+            let error = String::from_utf8(output.stderr)?;
+            assert!(error.contains(expected_message), "{error}");
+        }
+        let mut arguments =
+            json!({"root":workspace.path(), "targetKind":"image", "autoUpdate":false});
+        arguments[route.trim_start_matches('-')] = "unavailable image query".into();
+        let response = rpc(&modern_post(
+            port,
+            "tools/call",
+            json!({
+                "name":"zvec_grep_search", "arguments":arguments,
+            }),
+            "",
+        )?);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool error")
+                .contains(expected_message),
+            "{response}"
+        );
+    }
+    embedding.fail.store(false, Ordering::Release);
+    Ok(())
+}
+
+fn check_merged_cli_trace(
+    binary: &Path,
+    home: &TempDir,
+    workspace: &TempDir,
+) -> Result<(), Box<dyn Error>> {
+    let mut command = Command::new(binary);
+    configure_multimodal_command(&mut command, home, workspace);
+    let output = command
+        .args([
+            "--fts",
+            "orchard",
+            "--trace",
+            "--compact",
+            "--mode",
+            "direct",
+            "--refresh",
+            "off",
+        ])
+        .output()?;
+    assert_command_success(&output);
+    let text = String::from_utf8(output.stdout)?;
+    assert!(text.contains("text + code · rule-ranked"), "{text}");
+    assert!(
+        text.contains("scoring=rule recall=FullText merge=shared_recall_then_rules"),
+        "{text}"
+    );
+    assert!(text.contains("trace: {"), "{text}");
+    assert!(!text.contains("compatible_vector_scores"), "{text}");
     Ok(())
 }
 
@@ -34,14 +145,14 @@ fn check_multimodal_queries(
     workspace: &TempDir,
     port: u16,
     query: &[&str],
+    mcp_query: &serde_json::Value,
 ) -> Result<(), Box<dyn Error>> {
     let image_input = query[0] == "--input";
-    let mcp_query = if image_input {
-        json!({"queryImage": {"source": "path", "path": workspace.path().join(query[1])}})
-    } else {
-        json!({"vector": query[1]})
-    };
+    let fts_only = query == ["--fts", "orchard"];
     for target in [Some("code"), Some("image"), None] {
+        if fts_only && target == Some("image") {
+            continue;
+        }
         let mut direct_result = None;
         for mode in ["direct", "server"] {
             let mut command = Command::new(binary);
@@ -54,6 +165,7 @@ fn check_multimodal_queries(
                 "--limit",
                 "6",
                 "--json",
+                "--trace",
             ]);
             if let Some(kind) = target {
                 command.args(["--kind", kind]);
@@ -74,9 +186,15 @@ fn check_multimodal_queries(
                 let groups = result["diagnostics"]["index"]["result_groups"]
                     .as_array()
                     .expect("result groups");
-                assert_eq!(groups.len(), 3, "unpinned remote spaces remain grouped");
-                for kind in ["text", "code", "image"] {
-                    assert!(groups.iter().any(|group| group["kinds"] == json!([kind])));
+                if fts_only {
+                    assert_eq!(groups.len(), 1, "same-config FTS merges text and code");
+                    assert_eq!(groups[0]["kinds"], json!(["text", "code"]));
+                    assert_eq!(groups[0]["rule_ranking"], true);
+                } else {
+                    assert_eq!(groups.len(), 3, "unpinned remote spaces remain grouped");
+                    for kind in ["text", "code", "image"] {
+                        assert!(groups.iter().any(|group| group["kinds"] == json!([kind])));
+                    }
                 }
             }
             if mode == "direct" {
@@ -116,6 +234,7 @@ fn configure_multimodal_command(command: &mut Command, home: &TempDir, workspace
     command
         .current_dir(workspace.path())
         .env("ZVEC_GREP_HOME", home.path())
+        .env("ZVEC_GREP_INDEX_DIR", home.path().join("external-index"))
         .env(
             "ZVEC_GREP_WORKSPACE_REGISTRY",
             home.path().join("workspaces.json"),
@@ -163,6 +282,7 @@ fn build_multimodal_fixture(
     let output = command
         .args([
             "--index",
+            path_text(workspace.path())?,
             "--mode",
             "direct",
             "--embedding",
@@ -254,6 +374,7 @@ fn search_projection(result: &serde_json::Value) -> serde_json::Value {
             json!({
                 "rank": item["rank"], "path": item["relative_path"], "preview": item["preview"],
                 "score": item["score"],
+                "trace": item["trace"],
             })
         })
         .collect::<Vec<_>>();
@@ -273,6 +394,7 @@ fn assert_mcp_search_parity(
     arguments["root"] = json!(root);
     arguments["autoUpdate"] = json!(false);
     arguments["limit"] = json!(6);
+    arguments["trace"] = json!(true);
     if let Some(target) = target {
         arguments["targetKind"] = json!(target);
     }
@@ -325,7 +447,23 @@ fn assert_mcp_search_parity(
             text.contains(&format!("result group: {id} kinds={kinds} ")),
             "{text}"
         );
+        if group["rule_ranking"] == true {
+            assert!(text.contains("scoring=rule recall="), "{text}");
+        }
     }
+    let traces = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("trace: "))
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_traces = items
+        .iter()
+        .filter_map(|item| (!item["trace"].is_null()).then_some(item["trace"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        traces, expected_traces,
+        "MCP retains requested per-hit trace"
+    );
     Ok(())
 }
 
@@ -421,7 +559,7 @@ fn modern_http_discovery_tools_errors_and_remote_continuation() -> Result<(), Bo
                 let schema = &search["inputSchema"];
                 assert_eq!(schema["properties"]["limit"]["type"], "integer");
                 assert_eq!(schema["properties"]["fuse"]["type"], "boolean");
-                let required = schema["required"].as_array().expect("required root");
+                let required = schema["required"].as_array().cloned().unwrap_or_default();
                 assert!(!required.contains(&json!("limit")));
                 assert!(!required.contains(&json!("fuse")));
             }
@@ -525,5 +663,108 @@ fn check_protocol_versions(port: u16) -> Result<(), Box<dyn Error>> {
             "{initialized}"
         );
     }
+    Ok(())
+}
+
+fn check_independent_index_directories(
+    binary: &Path,
+    home: &TempDir,
+    workspace: &TempDir,
+    port: u16,
+    address: SocketAddr,
+) -> Result<(), Box<dyn Error>> {
+    let secondary = home.path().join("second-index");
+    let endpoint = format!("http://{address}/embeddings");
+    let mut command = Command::new(binary);
+    configure_multimodal_command(&mut command, home, workspace);
+    let output = command
+        .arg("--index")
+        .arg(workspace.path())
+        .args(["--mode", "server", "--index-dir"])
+        .arg(&secondary)
+        .args([
+            "--embedding",
+            "qwen/qwen3-vl-embedding",
+            "--endpoint",
+            &endpoint,
+            "--allow-remote",
+        ])
+        .output()?;
+    assert_command_success(&output);
+    let status = rpc(&modern_post(
+        port,
+        "tools/call",
+        json!({"name":"zvec_grep_index_status", "arguments":{"indexDir":secondary}}),
+        "",
+    )?);
+    assert_ne!(status["result"]["isError"], true, "{status}");
+    assert!(status.to_string().contains("second-index"), "{status}");
+    let mut command = Command::new(binary);
+    configure_multimodal_command(&mut command, home, workspace);
+    let output = command
+        .current_dir(home.path())
+        .args(["--fts", "orchard"])
+        .args(["--index-dir"])
+        .arg(&secondary)
+        .args([
+            "--mode",
+            "server",
+            "--refresh",
+            "wait",
+            "--allow-remote",
+            "--json",
+        ])
+        .output()?;
+    assert_command_success(&output);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(!result["items"].as_array().expect("items").is_empty());
+    let mcp = rpc(&modern_post(
+        port,
+        "tools/call",
+        json!({"name":"zvec_grep_search", "arguments":{
+            "indexDir":secondary, "fts":"orchard", "autoUpdate":false
+        }}),
+        "",
+    )?);
+    assert_ne!(mcp["result"]["isError"], true, "{mcp}");
+    assert!(mcp.to_string().contains("orchard"), "{mcp}");
+    let mut update = Command::new(binary);
+    configure_multimodal_command(&mut update, home, workspace);
+    assert_command_success(
+        &update
+            .current_dir(home.path())
+            .args(["--index", "--mode", "server", "--index-dir"])
+            .arg(&secondary)
+            .arg("--allow-remote")
+            .output()?,
+    );
+    let mut command = Command::new(binary);
+    configure_multimodal_command(&mut command, home, workspace);
+    assert_command_success(
+        &command
+            .current_dir(home.path())
+            .args([
+                "--index",
+                "--drop",
+                "--yes",
+                "--mode",
+                "server",
+                "--index-dir",
+            ])
+            .arg(&secondary)
+            .output()?,
+    );
+    let mut command = Command::new(binary);
+    configure_multimodal_command(&mut command, home, workspace);
+    assert_command_success(
+        &command
+            .args(["--status", "--mode", "server", "--check-ready"])
+            .output()?,
+    );
+    assert!(home.path().join("external-index/index").is_dir());
+    assert!(
+        !workspace.path().join(".zvec-grep").exists(),
+        "external index must not create a default workspace directory"
+    );
     Ok(())
 }

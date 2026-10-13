@@ -460,7 +460,7 @@ fn stored_model_info_preserves_metadata_and_accepts_runtime_changes() {
     let record: serde_json::Value = serde_json::from_slice(&persisted).expect("descriptor JSON");
     assert_eq!(
         record,
-        serde_json::json!({"tables": [{"kind": "text", "embedding": original}]})
+        serde_json::json!({"path_encoding": "components", "tables": [{"kind": "text", "embedding": original}]})
     );
     assert_eq!(
         read_json::<SchemaRecord>(&descriptor)
@@ -1760,10 +1760,120 @@ fn previous_development_schema_requires_rebuild_without_mutating_storage() {
 }
 
 #[test]
+fn native_path_development_schema_requires_rebuild_before_opening_collections() {
+    let home = tempfile::tempdir().expect("workspace");
+    let schema_path = home.path().join("schema.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({"tables": [text_table(schema())]}))
+        .expect("previous native-path schema");
+    fs::write(&schema_path, &bytes).expect("write previous schema");
+    for options in [
+        WorkspaceIndexStorageOptions::ReadOnly {
+            storage_path: home.path().to_owned(),
+        },
+        WorkspaceIndexStorageOptions::ReadWrite {
+            storage_path: home.path().to_owned(),
+            tables: vec![text_table(schema())],
+        },
+    ] {
+        let error = IndexStore::open(options)
+            .err()
+            .expect("reject native-path schema");
+        assert!(error.message().contains("rebuild the index"));
+        assert_eq!(fs::read(&schema_path).expect("unchanged schema"), bytes);
+        assert!(!home.path().join("files").exists());
+    }
+}
+
+#[test]
+fn relocated_storage_preserves_identities_filters_snapshots_and_allocation() {
+    let home = tempfile::tempdir().expect("workspace");
+    let original = home.path().join("original");
+    let relocated = home.path().join("relocated");
+    let storage = open(&original, false);
+    let (file, entry) = file_at(&storage, "rooms/客厅/design.txt");
+    storage
+        .replace_fixture_file(&file, std::slice::from_ref(&entry))
+        .expect("index file");
+    let retired = storage
+        .resolve_file_ids(&["deleted.txt".into()])
+        .expect("reserve ID")[0];
+    storage.close().expect("flush storage");
+    fs::rename(&original, &relocated).expect("move complete storage");
+
+    let reader = open(&relocated, true);
+    let stored = reader
+        .read_entity(&entry.entity.id)
+        .expect("read snapshot")
+        .expect("entity");
+    assert_eq!(stored.entity, entry.entity);
+    assert_eq!(stored.file.relative_path, file.relative_path);
+    assert_eq!(stored.file.id, file.id);
+    let filter = StorageSearchFilter {
+        path: Some(StoragePathFilter::Directory(
+            SourcePath::new("rooms/客厅").expect("directory"),
+        )),
+        ..StorageSearchFilter::default()
+    };
+    let hits = reader
+        .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], 1, Some(&filter))
+        .expect("filtered query after relocation");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].entity_id, entry.entity.id);
+    reader.close().expect("close reader");
+
+    let writer = open(&relocated, false);
+    assert_eq!(
+        writer
+            .resolve_file_ids(&[file.relative_path.to_path_buf()])
+            .expect("same file"),
+        [file.id]
+    );
+    let mut refreshed = stored.file;
+    refreshed.snapshot.modified_epoch_ms = Some(123_456);
+    writer
+        .update_file_snapshot(&refreshed)
+        .expect("refresh moved timestamp");
+    let updated = writer
+        .read_entity(&entry.entity.id)
+        .expect("snapshot")
+        .expect("entity");
+    assert_eq!(updated.file, refreshed);
+    assert_eq!(updated.entity, entry.entity);
+    assert_eq!(
+        writer.list_file_attributes().expect("query attributes")[0].modified_epoch_ms,
+        Some(123_456)
+    );
+    let mut changed_content = refreshed.clone();
+    changed_content.snapshot.content_hash = Some("different content".into());
+    assert!(writer.update_file_snapshot(&changed_content).is_err());
+    assert_eq!(
+        writer
+            .read_entity(&entry.entity.id)
+            .expect("unchanged snapshot")
+            .expect("entity")
+            .file,
+        refreshed
+    );
+    let next = writer
+        .resolve_file_ids(&["new.txt".into()])
+        .expect("new identity")[0];
+    assert!(next.get() > retired.get());
+    writer.delete_file(file.id).expect("delete moved file");
+    writer.close().expect("close writer");
+    let reader = open(&relocated, true);
+    assert!(
+        reader
+            .read_entity(&entry.entity.id)
+            .expect("read removed entity")
+            .is_none()
+    );
+}
+
+#[test]
 fn missing_kind_table_requires_rebuild_instead_of_opening_an_empty_table() {
     let home = tempfile::tempdir().expect("workspace");
     open(home.path(), false).close().expect("create storage");
-    let missing = home.path().join("fragments_text");
+    let missing = home.path().join("text");
     fs::remove_dir_all(&missing).expect("simulate lost collection");
     for options in [
         WorkspaceIndexStorageOptions::ReadOnly {

@@ -60,12 +60,20 @@ pub(crate) struct IndexStore {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaRecord {
+    path_encoding: PathEncoding,
     tables: Vec<ContentIndex>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PathEncoding {
+    Components,
 }
 
 impl SchemaRecord {
     fn new(tables: &[ContentIndex]) -> Self {
         Self {
+            path_encoding: PathEncoding::Components,
             tables: tables.to_vec(),
         }
     }
@@ -402,6 +410,27 @@ impl IndexStore {
         };
         file.validate()?;
         self.write(|state| replace_file(state, &file, &[], &[]))
+    }
+
+    pub(crate) fn update_file_snapshot(&self, file: &FileRecord) -> EngineResult<()> {
+        file.validate()?;
+        self.write(|state| {
+            let existing = state.files.fetch(&[file.id])?.remove(&file.id);
+            let valid = existing.as_ref().is_some_and(|existing| {
+                existing.index_status.is_indexed()
+                    && existing.index_status == file.index_status
+                    && existing.relative_path == file.relative_path
+                    && existing.snapshot.size_bytes == file.snapshot.size_bytes
+                    && existing.snapshot.content_hash == file.snapshot.content_hash
+            });
+            if !valid {
+                return Err(EngineError::invalid_argument(
+                    "snapshot refresh requires the same indexed file, content hash and size",
+                ));
+            }
+            let directories = state.directories.ensure(&file.relative_path)?;
+            state.files.put(file, &directories)
+        })
     }
 
     pub(crate) fn delete_file(&self, file_id: FileId) -> EngineResult<()> {

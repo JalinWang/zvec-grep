@@ -111,23 +111,23 @@ impl WorkspaceIndexService {
         })
     }
 
-    fn remember_workspace(&self, manifest: &WorkspaceManifest, previous_root: Option<&Path>) {
+    fn remember_workspace(&self, manifest: &WorkspaceManifest) {
         if let Some(registry) = self.optional_registry()
             && let Err(error) = registry.remember(
                 &manifest.workspace.name,
                 &manifest.workspace.root,
-                previous_root,
+                &manifest.path,
             )
         {
             tracing::warn!(%error, "index saved; optional workspace registry was not updated");
         }
     }
 
-    fn forget_workspace(&self, root: &Path, previous_root: Option<&Path>) -> bool {
+    fn forget_workspace(&self, root: &Path, home: &Path) -> bool {
         let Some(registry) = self.optional_registry() else {
             return false;
         };
-        match registry.forget(root, previous_root) {
+        match registry.forget(root, home) {
             Ok(removed) => removed,
             Err(error) => {
                 tracing::warn!(%error, "optional workspace registry was not updated");
@@ -149,10 +149,21 @@ impl WorkspaceIndexService {
             Workspace::validate_name(name)?;
         }
         normalize_model_paths(&mut options)?;
-        let requested_root = resolve_root(options.root.as_deref())?;
-        validate_workspace_root(&requested_root)?;
-        let location = workspace_index_location(&requested_root)?;
+        let implicit_source = options.root.is_none();
+        let location = crate::workspace::layout::index_location(
+            options.root.as_deref(),
+            options.index_dir.as_deref(),
+        )?;
+        crate::workspace::layout::validate_source_root(&location)?;
+        if implicit_source && options.changes.is_empty() {
+            options
+                .changes
+                .push(crate::api::index::options::WorkspaceChange::Rescan);
+        }
         options.root = Some(location.root.clone());
+        options.index_dir = Some(location.home.clone());
+        crate::workspace::layout::ensure_workspace_home(&location)?;
+        let _binding = crate::workspace::lock::bind_source(&location.home, &location.root)?;
         let home_lock = Arc::new(
             LockWait::new(options.signal.as_ref(), options.lock_timeout_ms)?
                 .acquire(
@@ -167,8 +178,34 @@ impl WorkspaceIndexService {
                 .await?,
         );
         // Check the on-disk version before any registry, recovery or storage mutation.
-        let existing =
-            inspect_workspace_manifest(&location.home)?.into_manifest(options.rebuild)?;
+        let ignore_override = options
+            .scan
+            .ignore_files
+            .as_deref()
+            .or_else(|| options.reset_paths.then_some([].as_slice()));
+        let existing = crate::workspace::manifest::inspect_workspace_manifest_with_ignore_files(
+            &location,
+            ignore_override,
+        )?
+        .into_manifest(options.rebuild)?;
+        if !options.changes.is_empty()
+            && existing
+                .as_ref()
+                .is_some_and(|manifest| manifest.workspace.root != location.root)
+        {
+            return Err(EngineError::resource_busy(
+                "workspace source directory changed while an update was pending; reopen the index before refreshing",
+            ));
+        }
+        if existing.is_none()
+            && !options.rebuild
+            && !has_build(&location.home)
+            && has_index_storage(&location.home)?
+        {
+            return Err(EngineError::storage_failure(
+                "index storage has no usable manifest; rebuild the index with `zg --index --rebuild`",
+            ));
+        }
         let scan = resolve_scan(existing.as_ref(), &options)?;
         crate::file_selection::GlobMatcher::new(&location.root, scan.globs())?;
         // Resolve all routes before any registry or storage mutation.
@@ -188,7 +225,7 @@ impl WorkspaceIndexService {
                     .as_ref()
                     .map(|manifest| manifest.workspace.name.clone())
             })
-            .or_else(|| abandoned.as_ref().map(|(name, _)| name.clone()))
+            .or(abandoned)
             .unwrap_or_else(|| workspace_name(&location.root));
         if options.rebuild {
             recover_build_for_rebuild(&location.home)?;
@@ -235,9 +272,6 @@ impl WorkspaceIndexService {
         };
         let pending = build.clone();
         let registration = manifest.clone();
-        let previous_root = existing
-            .as_ref()
-            .map(|manifest| manifest.recorded_root.as_path());
         let result = self
             .run_index(manifest, build, acquired, options, Arc::clone(&home_lock))
             .await;
@@ -249,7 +283,7 @@ impl WorkspaceIndexService {
             let _ = discard_build(&build);
         }
         if result.is_ok() {
-            self.remember_workspace(&registration, previous_root);
+            self.remember_workspace(&registration);
         }
         result
     }
@@ -290,6 +324,7 @@ impl WorkspaceIndexService {
             .collect::<Vec<_>>();
         let result = index_workspace(&IndexingContext {
             workspace_index: &manifest.workspace,
+            index_home: Some(&manifest.path),
             storage: &writer.session.storage,
             scanner: &self.scanner,
             embedding_models: &embedding_models,
@@ -341,12 +376,26 @@ impl WorkspaceIndexService {
         let _lock = wait
             .acquire(&location.home, LockMode::Read, "context.refresh")
             .await?;
-        let Some(manifest) = read_workspace_manifest(&location.home)? else {
+        let Some(manifest) = read_workspace_manifest(location)? else {
             return Ok(false);
         };
         if !is_indexed(&manifest) || manifest.workspace.index == IndexState::Disabled {
             return Ok(false);
         }
+        // Metadata drift must reach the writer even when the bytes are unchanged.
+        let status = self.read_status(&manifest, false).await?;
+        Ok(status.files_added > 0
+            || status.files_modified > 0
+            || status.files_deleted > 0
+            || status.files_pending > 0
+            || status.files_failed > 0)
+    }
+
+    async fn read_status(
+        &self,
+        manifest: &WorkspaceManifest,
+        compare_contents: bool,
+    ) -> Result<crate::api::info::result::IndexStats, EngineError> {
         let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
             storage_path: manifest.index_path(),
         })?;
@@ -358,31 +407,48 @@ impl WorkspaceIndexService {
                 .expect("enabled index")
                 .content_indexes(),
         )?;
-        let status =
-            get_workspace_index_status(&manifest.workspace, &storage, &self.scanner, None).await;
+        let status = get_workspace_index_status(
+            &manifest.workspace,
+            Some(&manifest.path),
+            &storage,
+            &self.scanner,
+            None,
+            compare_contents,
+        )
+        .await;
         let close = storage.close();
         let status = status?;
         close?;
-        Ok(status.files_added > 0
-            || status.files_modified > 0
-            || status.files_deleted > 0
-            || status.files_pending > 0
-            || status.files_failed > 0)
+        Ok(status)
     }
 
     pub(crate) async fn info(&self, options: InfoOptions) -> Result<InfoResult, EngineError> {
         let requested_root = resolve_root(options.root.as_deref())?;
-        let requested_location = workspace_index_location(&requested_root)?;
-        let Some(location) = find_nearest_workspace(&requested_root)? else {
+        let Some(location) = find_nearest_workspace(&requested_root, options.index_dir.as_deref())?
+        else {
             return Ok(unindexed_info(
-                requested_location,
+                workspace_index_location(&requested_root, options.index_dir.as_deref())?,
                 WorkspaceIndexPolicy::Uninitialized,
             ));
         };
+        if !location.manifest_path.exists() && !has_build(&location.home) {
+            let orphaned = has_index_storage(&location.home)?;
+            let info = unindexed_info(location, WorkspaceIndexPolicy::Uninitialized);
+            if orphaned {
+                return Ok(rebuild_required_info(
+                    info,
+                    None,
+                    "index storage has no usable manifest".into(),
+                ));
+            }
+            return Ok(info);
+        }
+        crate::workspace::layout::validate_storage_paths(&location.home)?;
         let _lock = LockWait::new(None, None)?
             .acquire(&location.home, LockMode::Read, "info")
             .await?;
-        let manifest = match inspect_workspace_manifest(&location.home)? {
+        let _binding = crate::workspace::lock::bind_source(&location.home, &location.root)?;
+        let manifest = match inspect_workspace_manifest(&location)? {
             ManifestState::Current(manifest) => manifest,
             ManifestState::Missing => {
                 return Ok(unindexed_info(
@@ -394,38 +460,24 @@ impl WorkspaceIndexService {
                 actual_version,
                 reason,
             } => {
-                let mut info = unindexed_info(location, WorkspaceIndexPolicy::Enabled);
-                info.compatibility = IndexCompatibility::RebuildRequired {
+                return Ok(rebuild_required_info(
+                    unindexed_info(location, WorkspaceIndexPolicy::Enabled),
                     actual_version,
-                    expected_version: CURRENT_INDEX_VERSION,
                     reason,
-                };
-                info.suggestion = Some("rebuild the index with `zg --index --rebuild`".to_owned());
-                return Ok(info);
+                ));
             }
         };
+        if manifest.workspace.root != location.root {
+            return Err(EngineError::resource_busy(
+                "workspace source directory changed; retry workspace inspection",
+            ));
+        }
         let metadata_indexed = is_indexed(&manifest);
         let storage_exists = IndexStore::exists(&manifest.index_path())?;
         let indexed = metadata_indexed && storage_exists;
-        let status = if options.include_status && indexed {
-            let storage = IndexStore::open(WorkspaceIndexStorageOptions::ReadOnly {
-                storage_path: manifest.index_path(),
-            })?;
-            storage.ensure_compatible(
-                &manifest
-                    .workspace
-                    .index
-                    .descriptor()
-                    .expect("enabled index")
-                    .content_indexes(),
-            )?;
-            let status =
-                get_workspace_index_status(&manifest.workspace, &storage, &self.scanner, None)
-                    .await;
-            let close = storage.close();
-            let status = status?;
-            close?;
-            Some(status)
+        let source_available = location.root.is_dir();
+        let status = if options.include_status && indexed && source_available {
+            Some(self.read_status(&manifest, true).await?)
         } else {
             None
         };
@@ -450,41 +502,48 @@ impl WorkspaceIndexService {
             },
             workspace_index: Some(workspace_info(&manifest)),
             status,
-            suggestion: workspace_suggestion(&manifest, indexed),
+            suggestion: if source_available {
+                workspace_suggestion(&manifest, indexed)
+            } else {
+                Some("source root is unavailable; specify the current source root to scan or update this index".into())
+            },
         })
     }
 
     pub(crate) async fn drop_index(&self, options: &InfoOptions) -> Result<bool, EngineError> {
-        let location = workspace_index_location_from_option(options.root.as_deref())?;
-        if !location.root.try_exists().map_err(|error| {
-            EngineError::from_io(
-                format!("inspect workspace root {}", location.root.display()),
-                &error,
-            )
-        })? {
-            return Ok(self.forget_workspace(&location.root, None));
-        }
+        let requested_root = resolve_root(options.root.as_deref())?;
+        let location = find_nearest_workspace(&requested_root, options.index_dir.as_deref())?
+            .map_or_else(
+                || workspace_index_location(&requested_root, options.index_dir.as_deref()),
+                Ok,
+            )?;
         let has_data = workspace_has_index_data(&location)?;
         if !has_data {
-            return Ok(self.forget_workspace(&location.root, None));
+            return Ok(self.forget_workspace(&location.root, &location.home));
         }
+        crate::workspace::layout::ensure_workspace_home(&location)?;
         let _lock = LockWait::new(None, None)?
             .acquire(&location.home, LockMode::Write, "index.drop")
             .await?;
-        let previous_root = read_workspace_manifest(&location.home)
-            .ok()
-            .flatten()
-            .map(|manifest| manifest.recorded_root)
-            .or_else(|| {
-                read_build_registration(&location.home)
-                    .ok()
-                    .flatten()
-                    .map(|(_, root)| root)
-            });
+        let _binding = crate::workspace::lock::bind_source(&location.home, &location.root)?;
         reset_workspace_index(&location)?;
-        self.forget_workspace(&location.root, previous_root.as_deref());
+        self.forget_workspace(&location.root, &location.home);
         Ok(true)
     }
+}
+
+fn rebuild_required_info(
+    mut info: InfoResult,
+    actual_version: Option<u32>,
+    reason: String,
+) -> InfoResult {
+    info.compatibility = IndexCompatibility::RebuildRequired {
+        actual_version,
+        expected_version: CURRENT_INDEX_VERSION,
+        reason,
+    };
+    info.suggestion = Some("rebuild the index with `zg --index --rebuild`".into());
+    info
 }
 
 fn workspace_has_index_data(location: &WorkspaceIndexLocation) -> Result<bool, EngineError> {
@@ -660,8 +719,9 @@ pub(crate) fn embedding_plan(
         if reference != &default_ref {
             request.api_key = None;
             request.endpoint = None;
-            request.device = None;
-            request.model_cache = None;
+            if !reference.starts_with("local/") {
+                request.device = None;
+            }
         }
         requests.insert(reference.clone(), request);
     }
@@ -764,6 +824,7 @@ fn acquire_model(
         let root = resolve_root(options.root.as_deref())?;
         crate::authorization::require_with_targets(
             &root,
+            options.index_dir.as_deref(),
             &reference,
             &endpoint,
             options.allow_remote,
@@ -782,7 +843,6 @@ fn acquire_model(
                     .map(|e| e.device)
                     .filter(|device| *device != Device::Auto)
             }),
-            existing_runtime.and_then(|runtime| runtime.device),
         )?
     } else {
         None
@@ -799,7 +859,6 @@ fn acquire_model(
                         .model_cache
                         .clone()
                         .or_else(|| options.embedding.as_ref().and_then(|e| e.cache_dir.clone())),
-                    existing_runtime.and_then(|runtime| runtime.cache_dir.clone()),
                 ),
                 device,
             },
@@ -903,37 +962,16 @@ fn embedding_runtime(
                 .cloned()
         })
         .unwrap_or_default();
-    let config = crate::config::read()?;
     if model.info().model().provider() == "local" {
-        let reference = model.info().model().reference();
-        Ok(StoredModelConfig {
-            cache_dir: crate::config::model_cache(
-                &config,
-                options
-                    .model_cache
-                    .clone()
-                    .or_else(|| options.embedding.as_ref().and_then(|e| e.cache_dir.clone())),
-                current.cache_dir,
-            ),
-            device: crate::config::runtime_device(
-                &config,
-                &reference,
-                options.device.or_else(|| {
-                    options
-                        .embedding
-                        .as_ref()
-                        .map(|e| e.device)
-                        .filter(|device| *device != Device::Auto)
-                }),
-                current.device,
-            )?,
-            ..StoredModelConfig::default()
-        })
+        Ok(StoredModelConfig::default())
     } else {
         Ok(StoredModelConfig {
             api_key: match options.api_key.as_deref() {
                 Some(key) => Some(EncryptedApiKey::seal(
-                    &resolve_root(options.root.as_deref())?.join(".zvec-grep"),
+                    options
+                        .index_dir
+                        .as_deref()
+                        .ok_or_else(|| EngineError::internal("index location was not resolved"))?,
                     &model.info().model().reference(),
                     key,
                     existing.is_none_or(|manifest| {
@@ -949,30 +987,12 @@ fn embedding_runtime(
                 .configured_endpoint()
                 .map(str::to_owned)
                 .or(current.endpoint),
-            device: None,
-            cache_dir: None,
         })
     }
 }
 
 pub(in crate::pipelines) fn is_indexed(manifest: &WorkspaceManifest) -> bool {
     manifest.workspace.index_enabled() && manifest.index_version.is_some()
-}
-
-fn validate_workspace_root(root: &Path) -> Result<(), EngineError> {
-    if !root.is_dir() {
-        return Err(EngineError::invalid_argument(format!(
-            "workspace root must be an existing directory: {}",
-            root.display()
-        )));
-    }
-    Ok(())
-}
-
-fn workspace_index_location_from_option(
-    root: Option<&Path>,
-) -> Result<WorkspaceIndexLocation, EngineError> {
-    workspace_index_location(&resolve_root(root)?)
 }
 
 fn resolve_root(root: Option<&Path>) -> Result<PathBuf, EngineError> {
@@ -1052,6 +1072,14 @@ mod tests {
 
     use super::{ModelRuntimeManager, WorkspaceIndexService};
 
+    fn read_manifest(
+        home: &std::path::Path,
+    ) -> crate::EngineResult<Option<super::WorkspaceManifest>> {
+        let location =
+            super::workspace_index_location(home.parent().expect("source root"), Some(home))?;
+        super::read_workspace_manifest(&location)
+    }
+
     fn write_previous_index_version(
         home: &std::path::Path,
         manifest: &crate::workspace::manifest::WorkspaceManifest,
@@ -1063,6 +1091,54 @@ mod tests {
             serde_json::to_vec(&previous).expect("previous manifest JSON"),
         )
         .expect("previous index metadata");
+    }
+
+    #[tokio::test]
+    async fn inspection_rejects_source_changed_while_waiting_for_the_read_lock() {
+        let directory = tempdir().expect("workspace package");
+        let parent = directory.path().canonicalize().expect("parent");
+        let root = parent.join("materials");
+        let replacement = parent.join("replacement");
+        let home = parent.join("index");
+        std::fs::create_dir(&root).expect("source");
+        std::fs::create_dir(&replacement).expect("replacement source");
+        let mut manifest = crate::workspace::manifest::WorkspaceManifest::new(
+            Workspace {
+                name: "fixture".into(),
+                root: root.clone(),
+                scan: crate::domain::ScanRules::default(),
+                index: IndexState::Uninitialized,
+                created_epoch_ms: 0,
+                updated_epoch_ms: 0,
+            },
+            home.clone(),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("manifest");
+        super::write_workspace_manifest(&home, &manifest).expect("initial manifest");
+        let write_lock = crate::workspace::lock::acquire_home_lock(
+            &home,
+            super::LockMode::Write,
+            "source change fixture",
+        )
+        .expect("writer");
+        let service = WorkspaceIndexService::with_test_registry();
+        let inspection = service.info(InfoOptions {
+            root: Some(root),
+            index_dir: Some(home.clone()),
+            include_status: false,
+        });
+        tokio::pin!(inspection);
+        assert!(futures_util::poll!(&mut inspection).is_pending());
+        manifest.workspace.root = replacement;
+        super::write_workspace_manifest(&home, &manifest).expect("publish source change");
+        drop(write_lock);
+        let error = inspection
+            .await
+            .expect_err("mixed source metadata is rejected");
+        assert_eq!(error.code(), crate::EngineError::RESOURCE_BUSY);
+        assert!(error.message().contains("retry workspace inspection"));
     }
 
     #[test]
@@ -1176,9 +1252,7 @@ mod tests {
             .index(&models, options.clone())
             .await
             .expect("empty workspace requires no remote embedding requests");
-        let initial = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("manifest");
+        let initial = read_manifest(&home).expect("read").expect("manifest");
         assert_eq!(
             initial.embedding_runtimes[reference].endpoint.as_deref(),
             Some("https://first.example.test/v1/embeddings")
@@ -1189,7 +1263,7 @@ mod tests {
             .index(&models, options.clone())
             .await
             .expect("another endpoint for the same model reuses the index");
-        let updated = super::read_workspace_manifest(&home)
+        let updated = read_manifest(&home)
             .expect("read")
             .expect("updated manifest");
         assert_eq!(updated.workspace.index, initial.workspace.index);
@@ -1208,7 +1282,7 @@ mod tests {
             .index(&models, options.clone())
             .await
             .expect("reopen uses the persisted endpoint");
-        let reopened = super::read_workspace_manifest(&home)
+        let reopened = read_manifest(&home)
             .expect("read")
             .expect("reopened manifest");
         assert_eq!(reopened.workspace.index, updated.workspace.index);
@@ -1260,11 +1334,7 @@ mod tests {
             .await
             .expect("save key");
         let home = root.join(".zvec-grep");
-        let read = || {
-            super::read_workspace_manifest(&home)
-                .expect("read")
-                .expect("manifest")
-        };
+        let read = || read_manifest(&home).expect("read").expect("manifest");
         let first = read();
         assert_eq!(
             super::workspace_api_key(Some(&first), reference, None)
@@ -1338,7 +1408,7 @@ mod tests {
         models.close();
         let moved = directory.path().join("moved");
         std::fs::rename(&root, &moved).expect("move workspace");
-        let reopened = super::read_workspace_manifest(&moved.join(".zvec-grep"))
+        let reopened = read_manifest(&moved.join(".zvec-grep"))
             .expect("read moved")
             .expect("manifest");
         assert_eq!(
@@ -1382,6 +1452,7 @@ mod tests {
         assert!(!error.message().contains("second-test-secret"));
         service
             .drop_index(&InfoOptions {
+                index_dir: None,
                 root: Some(moved.clone()),
                 include_status: false,
             })
@@ -1423,12 +1494,13 @@ mod tests {
             )
             .await
             .expect("empty workspace index");
-        let before = super::read_workspace_manifest(&original.join(".zvec-grep"))
+        let before = read_manifest(&original.join(".zvec-grep"))
             .expect("manifest read")
             .expect("manifest");
         std::fs::rename(&original, &moved).expect("move workspace");
         let info = service
             .info(InfoOptions {
+                index_dir: None,
                 root: Some(moved.clone()),
                 include_status: true,
             })
@@ -1456,17 +1528,23 @@ mod tests {
             )
             .await
             .expect("update moved workspace");
-        let after = super::read_workspace_manifest(&moved.join(".zvec-grep"))
+        let after = read_manifest(&moved.join(".zvec-grep"))
             .expect("manifest read")
             .expect("manifest");
         assert_eq!(after.workspace.name, before.workspace.name);
         assert_eq!(after.workspace.scan.globs(), before.workspace.scan.globs());
-        assert_eq!(after.workspace.scan.ignore_files(), [moved.join(".ignore")]);
         assert_eq!(
-            after.embedding_runtimes["local/potion-code-16m-v2"].cache_dir,
-            Some(moved.join(".zvec-grep/models"))
+            after.workspace.scan.ignore_files(),
+            [std::path::PathBuf::from(".ignore")]
         );
-        assert_eq!(after.workspace.root, moved);
+        assert_eq!(
+            after.embedding_runtimes["local/potion-code-16m-v2"],
+            super::StoredModelConfig::default()
+        );
+        assert_eq!(
+            after.workspace.root,
+            std::fs::canonicalize(&moved).expect("canonical source")
+        );
         assert_eq!(
             service
                 .registry()
@@ -1485,6 +1563,7 @@ mod tests {
         assert!(
             !WorkspaceIndexService::with_test_registry()
                 .drop_index(&InfoOptions {
+                    index_dir: None,
                     root: Some(directory.path().to_path_buf()),
                     include_status: false,
                 })
@@ -1498,9 +1577,16 @@ mod tests {
         let directory = tempdir().expect("workspace");
         let home = directory.path().join(".zvec-grep");
         let storage = home.join("index");
-        std::fs::create_dir_all(&storage).expect("orphaned generation");
         let service = WorkspaceIndexService::with_test_registry();
+        let models = ModelRuntimeManager::new();
+        service
+            .index(&models, empty_index_options(directory.path()))
+            .await
+            .expect("real index");
+        models.close();
+        std::fs::remove_file(home.join("manifest.json")).expect("orphaned storage");
         let options = InfoOptions {
+            index_dir: None,
             root: Some(directory.path().to_path_buf()),
             include_status: false,
         };
@@ -1533,9 +1619,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let active = super::read_workspace_manifest(&home)
-            .expect("manifest")
-            .expect("active");
+        let active = read_manifest(&home).expect("manifest").expect("active");
         let signal = tokio_util::sync::CancellationToken::new();
         signal.cancel();
         service
@@ -1550,7 +1634,7 @@ mod tests {
             .await
             .expect_err("cancelled rebuild");
         assert_eq!(
-            super::read_workspace_manifest(&home).expect("manifest"),
+            read_manifest(&home).expect("manifest"),
             Some(active.clone())
         );
         assert!(active.index_path().exists());
@@ -1558,14 +1642,13 @@ mod tests {
         let refresh = crate::pipelines::indexed_search::service::refresh_options(
             &crate::api::context::ContextOptions::default(),
             directory.path().to_path_buf(),
+            home.clone(),
         );
         service
             .index(&models, refresh)
             .await
             .expect("ordinary refresh updates active index");
-        let updated = super::read_workspace_manifest(&home)
-            .expect("manifest")
-            .expect("active");
+        let updated = read_manifest(&home).expect("manifest").expect("active");
         assert_eq!(updated.storage_generation, active.storage_generation);
         assert_eq!(updated.workspace.name, active.workspace.name);
         assert!(active.index_path().exists());
@@ -1579,9 +1662,7 @@ mod tests {
             )
             .await
             .expect("fresh rebuild");
-        let rebuilt = super::read_workspace_manifest(&home)
-            .expect("manifest")
-            .expect("active");
+        let rebuilt = read_manifest(&home).expect("manifest").expect("active");
         assert_ne!(rebuilt.storage_generation, active.storage_generation);
         assert_eq!(rebuilt.index_path(), active.index_path());
         assert!(rebuilt.index_path().exists());
@@ -1598,13 +1679,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let mut manifest = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("manifest");
-        for runtime in manifest.embedding_runtimes.values_mut() {
-            runtime.device = Some(Device::Auto);
-        }
-        super::write_workspace_manifest(&home, &manifest).expect("save automatic device");
+        let manifest = read_manifest(&home).expect("read").expect("manifest");
         let request = crate::api::context::ContextOptions {
             device: Some(Device::Cpu),
             ..Default::default()
@@ -1612,11 +1687,10 @@ mod tests {
         let options = crate::pipelines::indexed_search::service::refresh_options(
             &request,
             directory.path().to_path_buf(),
+            home.clone(),
         );
         service.index(&models, options).await.expect("refresh");
-        let refreshed = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("manifest");
+        let refreshed = read_manifest(&home).expect("read").expect("manifest");
         assert_eq!(refreshed.embedding_runtimes, manifest.embedding_runtimes);
         service
             .index(
@@ -1629,14 +1703,12 @@ mod tests {
             )
             .await
             .expect("explicit configuration update");
-        let configured = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("manifest");
+        let configured = read_manifest(&home).expect("read").expect("manifest");
         assert!(
             configured
                 .embedding_runtimes
                 .values()
-                .all(|runtime| runtime.device == Some(Device::Cpu))
+                .all(|runtime| *runtime == super::StoredModelConfig::default())
         );
         models.close();
     }
@@ -1652,9 +1724,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let active = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("active");
+        let active = read_manifest(&home).expect("read").expect("active");
         let mut target = active.clone();
         let mut globs = target.workspace.scan.globs().to_vec();
         globs.push("*.rs".into());
@@ -1677,9 +1747,7 @@ mod tests {
             .index(&models, options.clone())
             .await
             .expect("ordinary index uses active settings");
-        let updated = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("active");
+        let updated = read_manifest(&home).expect("read").expect("active");
         assert_eq!(updated.storage_generation, active.storage_generation);
         assert_eq!(updated.workspace.scan, active.workspace.scan);
         assert_eq!(updated.embedding_runtimes, active.embedding_runtimes);
@@ -1699,9 +1767,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let active = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("active");
+        let active = read_manifest(&home).expect("read").expect("active");
         let published = super::prepare_build(active.clone()).expect("build");
         std::fs::create_dir_all(published.index_path()).expect("completed storage");
         super::write_workspace_manifest(&home, &published.target)
@@ -1716,9 +1782,7 @@ mod tests {
             )
             .await
             .expect("fresh explicit rebuild");
-        let rebuilt = super::read_workspace_manifest(&home)
-            .expect("read")
-            .expect("active");
+        let rebuilt = read_manifest(&home).expect("read").expect("active");
         assert_ne!(
             rebuilt.storage_generation,
             published.target.storage_generation
@@ -1741,9 +1805,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let active = super::read_workspace_manifest(&home)
-            .expect("manifest")
-            .expect("active");
+        let active = read_manifest(&home).expect("manifest").expect("active");
         service.fail_index_completion = true;
         let error = service
             .index(
@@ -1757,13 +1819,13 @@ mod tests {
             .expect_err("checkpoint fails");
         assert!(error.message().contains("checkpoint"));
         assert_eq!(
-            super::read_workspace_manifest(&home).expect("manifest"),
+            read_manifest(&home).expect("manifest"),
             Some(active.clone())
         );
         assert!(active.index_path().exists());
         assert!(!super::has_build(&home));
         // The unchanged active index does not need a query-driven refresh.
-        let location = super::workspace_index_location(directory.path()).expect("location");
+        let location = super::workspace_index_location(directory.path(), None).expect("location");
         assert!(
             !service
                 .workspace_needs_refresh(
@@ -1776,6 +1838,7 @@ mod tests {
         assert!(
             service
                 .drop_index(&InfoOptions {
+                    index_dir: None,
                     root: Some(directory.path().to_path_buf()),
                     include_status: false
                 })
@@ -1820,12 +1883,13 @@ mod tests {
         let parent_home = root.join(".zvec-grep");
         let parent_bytes =
             std::fs::read(parent_home.join("manifest.json")).expect("parent manifest");
-        let parent = super::read_workspace_manifest(&parent_home)
+        let parent = read_manifest(&parent_home)
             .expect("manifest read")
             .expect("parent manifest");
         assert_eq!(
             service
                 .info(InfoOptions {
+                    index_dir: None,
                     root: Some(child.clone()),
                     include_status: false
                 })
@@ -1844,7 +1908,7 @@ mod tests {
             .await
             .expect("independent child index");
         let child_home = child.join(".zvec-grep");
-        let indexed = super::read_workspace_manifest(&child_home)
+        let indexed = read_manifest(&child_home)
             .expect("child manifest read")
             .expect("child owns its manifest");
         assert_eq!(indexed.workspace.root, child);
@@ -1872,6 +1936,7 @@ mod tests {
         assert_eq!(
             service
                 .info(InfoOptions {
+                    index_dir: None,
                     root: Some(child.clone()),
                     include_status: true
                 })
@@ -1910,6 +1975,30 @@ mod tests {
         assert_nested_index_keeps_parent("local/potion-code-16m-v2", true).await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_lock_directory_is_rejected_before_writing_outside_the_home() {
+        let directory = tempdir().expect("fixture");
+        let root = directory.path().join("source");
+        let home = directory.path().join("data");
+        let outside = directory.path().join("outside");
+        for path in [&root, &home, &outside] {
+            std::fs::create_dir(path).expect("directory");
+        }
+        std::fs::write(home.join("manifest.json"), b"{}").expect("manifest");
+        std::os::unix::fs::symlink(&outside, home.join("locks")).expect("linked locks");
+        let service = WorkspaceIndexService::with_test_registry();
+        let options = InfoOptions {
+            root: Some(root.clone()),
+            index_dir: Some(home.clone()),
+            ..InfoOptions::default()
+        };
+        assert!(service.info(options.clone()).await.is_err());
+        assert!(service.drop_index(&options).await.is_err());
+        assert!(crate::workspace::lock::bind_source(&home, &root).is_err());
+        assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
+    }
+
     #[tokio::test]
     async fn explicit_drop_releases_a_deleted_source_directory_without_recreating_it() {
         let directory = tempdir().expect("workspace roots");
@@ -1931,6 +2020,7 @@ mod tests {
             .expect("original workspace owns name");
         std::fs::remove_dir_all(&deleted).expect("source directory deleted externally");
         let options = InfoOptions {
+            index_dir: None,
             root: Some(deleted.clone()),
             include_status: false,
         };
@@ -1991,6 +2081,7 @@ mod tests {
         assert!(
             service
                 .drop_index(&InfoOptions {
+                    index_dir: None,
                     root: Some(moved.clone()),
                     include_status: false,
                 })
@@ -2067,6 +2158,7 @@ mod tests {
                 .expect("index");
             let info = service
                 .info(InfoOptions {
+                    index_dir: None,
                     root: Some(root.clone()),
                     include_status: true,
                 })
@@ -2095,6 +2187,7 @@ mod tests {
             .await
             .expect("optional registry cannot fail a published index");
         let options = InfoOptions {
+            index_dir: None,
             root: Some(root),
             include_status: true,
         };
@@ -2123,7 +2216,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let before = super::read_workspace_manifest(&home)
+        let before = read_manifest(&home)
             .expect("manifest")
             .expect("active workspace");
         let marker = before.index_path().join("checkpoint-marker");
@@ -2139,7 +2232,7 @@ mod tests {
             )
             .await
             .expect("rename workspace");
-        let after = super::read_workspace_manifest(&home)
+        let after = read_manifest(&home)
             .expect("manifest")
             .expect("renamed workspace");
         assert_eq!(after.workspace.name.as_str(), "after");
@@ -2154,6 +2247,7 @@ mod tests {
         );
         let info = service
             .info(InfoOptions {
+                index_dir: None,
                 root: Some(directory.path().to_path_buf()),
                 include_status: false,
             })
@@ -2170,7 +2264,7 @@ mod tests {
             )
             .await
             .expect("update keeps new name");
-        let updated = super::read_workspace_manifest(&home)
+        let updated = read_manifest(&home)
             .expect("manifest")
             .expect("updated workspace");
         assert_eq!(updated.workspace.name, after.workspace.name);
@@ -2206,7 +2300,7 @@ mod tests {
             .await
             .expect("initial index");
         let home = directory.path().join(".zvec-grep");
-        let before = super::read_workspace_manifest(&home)
+        let before = read_manifest(&home)
             .expect("manifest")
             .expect("active workspace");
         service
@@ -2216,6 +2310,7 @@ mod tests {
             .expect("commit registry rename before crash");
         let info = service
             .info(InfoOptions {
+                index_dir: None,
                 root: Some(directory.path().to_path_buf()),
                 include_status: false,
             })
@@ -2223,7 +2318,7 @@ mod tests {
             .expect("info reconciles name");
         assert_eq!(info.workspace_index.expect("workspace").name, "before");
         assert_eq!(
-            super::read_workspace_manifest(&home).expect("read-only info retained manifest"),
+            read_manifest(&home).expect("read-only info retained manifest"),
             Some(before.clone())
         );
         service
@@ -2236,7 +2331,7 @@ mod tests {
             )
             .await
             .expect("index replays rename");
-        let after = super::read_workspace_manifest(&home)
+        let after = read_manifest(&home)
             .expect("manifest")
             .expect("reconciled workspace");
         assert_eq!(after.workspace.name.as_str(), "before");
@@ -2254,6 +2349,7 @@ mod tests {
         let before = move_after_interrupted_rename(&service, &models, &original, &moved).await;
         let info = service
             .info(InfoOptions {
+                index_dir: None,
                 root: Some(moved.clone()),
                 include_status: false,
             })
@@ -2268,7 +2364,7 @@ mod tests {
         );
         let home = moved.join(".zvec-grep");
         assert_eq!(
-            super::read_workspace_manifest(&home)
+            read_manifest(&home)
                 .expect("manifest")
                 .expect("unchanged persisted name")
                 .workspace
@@ -2285,7 +2381,7 @@ mod tests {
             )
             .await
             .expect("index rebinds the renamed workspace after the move");
-        let after = super::read_workspace_manifest(&home)
+        let after = read_manifest(&home)
             .expect("manifest")
             .expect("reconciled workspace");
         assert_eq!(after.workspace.name, before.workspace.name);
@@ -2318,6 +2414,7 @@ mod tests {
         assert!(
             service
                 .drop_index(&InfoOptions {
+                    index_dir: None,
                     root: Some(moved),
                     include_status: false,
                 })
@@ -2371,7 +2468,7 @@ mod tests {
             )
             .await
             .expect("initial index");
-        let before = super::read_workspace_manifest(&original.join(".zvec-grep"))
+        let before = read_manifest(&original.join(".zvec-grep"))
             .expect("manifest")
             .expect("active workspace");
         service
@@ -2409,6 +2506,7 @@ mod tests {
             None
         );
         let info = InfoOptions {
+            index_dir: None,
             root: Some(directory.path().to_path_buf()),
             include_status: false,
         };
@@ -2443,11 +2541,7 @@ mod tests {
             .index(&models, empty_index_options(directory.path()))
             .await
             .expect("fresh initial build");
-        assert!(
-            super::read_workspace_manifest(&home)
-                .expect("manifest")
-                .is_some()
-        );
+        assert!(read_manifest(&home).expect("manifest").is_some());
         models.close();
     }
 
@@ -2469,6 +2563,7 @@ mod tests {
         assert_eq!(result.files_scanned, 0);
 
         let info_options = InfoOptions {
+            index_dir: None,
             root: Some(root.clone()),
             include_status: true,
         };
@@ -2479,17 +2574,14 @@ mod tests {
         assert!(info.indexed);
         assert_eq!(info.status.expect("index status").files_stored, 0);
         assert!(info.workspace_index.is_some());
-        let manifest = super::read_workspace_manifest(&info.home)
+        let manifest = read_manifest(&info.home)
             .expect("manifest read")
             .expect("manifest");
-        assert_eq!(
+        assert!(
             manifest
                 .embedding_runtimes
                 .values()
-                .next()
-                .expect("runtime")
-                .cache_dir,
-            Some(root.join("model-cache"))
+                .all(|runtime| *runtime == super::StoredModelConfig::default())
         );
         crate::pipelines::indexed_search::service::context(
             &service,
@@ -2536,7 +2628,7 @@ mod tests {
             )
             .await
             .expect("rebuild uses explicitly supplied configuration");
-        let rebuilt = super::read_workspace_manifest(&info.home)
+        let rebuilt = read_manifest(&info.home)
             .expect("manifest read")
             .expect("manifest");
         assert_eq!(rebuilt.index_version, Some(super::CURRENT_INDEX_VERSION));

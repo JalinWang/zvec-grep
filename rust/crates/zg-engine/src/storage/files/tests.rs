@@ -21,6 +21,7 @@ fn source_file_projection_preserves_paths_and_directory_membership_for_all_statu
     assert!(!files_schema().expect("file schema").has_field("formats"));
     let directories = [DirectoryId::new(0), DirectoryId::new(1)];
     let mut source = file(12, Path::new("src").join("nested").join("name.rs"));
+    let portable_path = r#"{"components":["src","nested","name.rs"]}"#;
     source.snapshot.content_hash = Some("fixture-hash".into());
     for status in [
         FileIndexStatus::NotIndexed,
@@ -37,6 +38,14 @@ fn source_file_projection_preserves_paths_and_directory_membership_for_all_statu
         let doc = encode_file_doc(&source, &directories).expect("encode source");
         assert_eq!(doc.get_pk(), Some("f12"));
         assert!(!doc.has_field("formats"));
+        assert_eq!(
+            string_field(&doc, "path").expect("portable path"),
+            portable_path
+        );
+        assert_eq!(
+            string_field(&doc, "path_key").expect("portable path key"),
+            hex::encode(portable_path.as_bytes())
+        );
         assert_eq!(
             string_field(&doc, "relative_path").expect("query path"),
             "src/nested/name.rs"

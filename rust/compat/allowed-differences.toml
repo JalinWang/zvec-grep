@@ -66,3 +66,9 @@ id = "mcp-workspace-status-storage-metadata"
 owner = "MCP/storage"
 reason = "Rust workspace_index.id 使用持久工作区名称而非 Node 的内部标识格式；调用方应将其视为不透明标识。Rust 尚未持久化 embedding 输入截断统计，因此不虚构 truncated_fragments=0，保留现有真实 status 统计。验证：status 序列化和引擎 info 回归；scan_diagnostics 的完整计数独立于有界样本。"
 removal_condition = "底层存储支持截断统计或统一工作区标识后补齐字段，并添加真实索引回归。"
+
+[[difference]]
+id = "mcp-portable-index-selection"
+owner = "MCP/workspace"
+reason = "Rust accepts indexDir without a redundant root for existing-index search, status, deletion and updates. The saved source path is resolved relative to that index; creating a new index still requires an explicit source root. Managed rg remains source-root based and independent of index selection. Tool instructions reflect these location rules."
+removal_condition = "Node supports the same portable index selection, or the TypeScript compatibility layer is retired."

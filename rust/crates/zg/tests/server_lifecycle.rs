@@ -656,9 +656,10 @@ fn server_on_exposes_agent_tools_and_off_stops_it() -> Result<(), Box<dyn Error>
     // public MCP toolset, so status remains available with the agent profile.
     // Pin the display home so temporary paths are rendered consistently even
     // when the runner's temporary directory is inside its real user home.
+    let display_home = std::fs::canonicalize(home.path())?;
     let cli_status = Command::new(&guard.binary)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        .env("HOME", &display_home)
+        .env("USERPROFILE", &display_home)
         .args(["--status", "--mode", "server", "--home"])
         .arg(&guard.home)
         .arg(home.path())
@@ -850,7 +851,8 @@ fn full_toolset_exposes_lifecycle_tools_and_runs_managed_rg() -> Result<(), Box<
         }
         assert!(
             Instant::now() < deadline,
-            "index did not complete: {response}"
+            "index did not complete: {response}\n{}",
+            log_tail(&home.path().join("daemon/logs/server.log"), 0)
         );
         std::thread::sleep(Duration::from_millis(50));
     };

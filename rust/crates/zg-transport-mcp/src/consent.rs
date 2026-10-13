@@ -236,6 +236,7 @@ mod tests {
             context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, rmcp::ErrorData> {
             let target = IndexAuthorization {
+                index_dir: std::env::temp_dir().join("consent-workspace/.zvec-grep"),
                 root: std::env::temp_dir().join("consent-workspace"),
                 workspace_roots: vec![std::env::temp_dir().join("consent-source")],
                 model: "remote/test-model".into(),
@@ -444,6 +445,7 @@ mod tests {
     #[test]
     fn once_consent_records_only_the_disclosed_destination() {
         let target = IndexAuthorization {
+            index_dir: std::env::temp_dir().join("consent-workspace/.zvec-grep"),
             root: std::env::temp_dir().join("consent-workspace"),
             workspace_roots: vec![std::env::temp_dir().join("consent-workspace")],
             model: "qwen/text-embedding-v4".into(),

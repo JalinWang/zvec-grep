@@ -48,11 +48,12 @@ fn stored_paths(index_path: &Path) -> TestResult<BTreeSet<PathBuf>> {
     Ok(native_file_records(index_path)?
         .iter()
         .map(|file| {
-            PathBuf::from(
-                file["relative_path"]["value"]
-                    .as_str()
-                    .expect("UTF-8 fixture path"),
-            )
+            file["relative_path"]["components"]
+                .as_array()
+                .expect("portable fixture path")
+                .iter()
+                .map(|component| component.as_str().expect("UTF-8 fixture component"))
+                .collect()
         })
         .collect())
 }
@@ -461,7 +462,7 @@ async fn filename_formats_and_categories_filter_queries_without_limiting_indexin
     let files = native_file_records(&info.index_path)?;
     let script = files
         .iter()
-        .find(|file| file["relative_path"]["value"] == "script")
+        .find(|file| file["relative_path"]["components"] == json!(["script"]))
         .expect("stored script");
     assert!(script.get("formats").is_none());
 
@@ -482,7 +483,7 @@ async fn filename_formats_and_categories_filter_queries_without_limiting_indexin
     assert!(
         files
             .iter()
-            .all(|file| file["relative_path"]["value"] != "script")
+            .all(|file| file["relative_path"]["components"] != json!(["script"]))
     );
     assert_index_and_queries(
         &engine,

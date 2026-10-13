@@ -26,6 +26,7 @@ struct RegistryDocument {
 struct Registration {
     name: String,
     root: PathBuf,
+    index_dir: PathBuf,
 }
 
 impl WorkspaceRegistry {
@@ -52,39 +53,35 @@ impl WorkspaceRegistry {
         Ok(Self { path })
     }
 
-    pub(crate) fn remember(
-        &self,
-        name: &str,
-        root: &Path,
-        previous_root: Option<&Path>,
-    ) -> EngineResult<()> {
+    pub(crate) fn remember(&self, name: &str, root: &Path, index_dir: &Path) -> EngineResult<()> {
         Workspace::validate_name(name)?;
         let root = canonical_root(root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "remember workspace")?;
         let mut document = self.read()?;
-        let previous = vanished_root(previous_root, &root)?;
+        let index_dir = super::layout::canonical_path(index_dir)?;
         document
             .workspaces
-            .retain(|entry| entry.root != root && Some(&entry.root) != previous.as_ref());
+            .retain(|entry| entry.index_dir != index_dir && entry.index_dir.is_dir());
         document.workspaces.push(Registration {
             name: name.to_owned(),
             root,
+            index_dir,
         });
         self.write(&document)
     }
 
-    pub(crate) fn forget(&self, root: &Path, previous_root: Option<&Path>) -> EngineResult<bool> {
+    pub(crate) fn forget(&self, root: &Path, index_dir: &Path) -> EngineResult<bool> {
         if !self.path.exists() {
             return Ok(false);
         }
         let root = existing_or_absolute_root(root)?;
         let _lock = acquire_exclusive_lock(&self.lock_path(), "forget workspace")?;
         let mut document = self.read()?;
-        let previous = vanished_root(previous_root, &root)?;
+        let index_dir = super::layout::canonical_path(index_dir)?;
         let before = document.workspaces.len();
-        document
-            .workspaces
-            .retain(|entry| entry.root != root && Some(&entry.root) != previous.as_ref());
+        document.workspaces.retain(|entry| {
+            (entry.root != root || entry.index_dir != index_dir) && entry.index_dir.is_dir()
+        });
         if before == document.workspaces.len() {
             return Ok(false);
         }
@@ -115,7 +112,7 @@ impl WorkspaceRegistry {
 
     #[cfg(test)]
     pub(crate) fn rename(&self, _old: &str, new: &str, root: &Path) -> EngineResult<()> {
-        self.remember(new, root, None)
+        self.remember(new, root, &root.join(".zvec-grep"))
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -142,11 +139,11 @@ impl WorkspaceRegistry {
         for entry in &document.workspaces {
             Workspace::validate_name(&entry.name)
                 .map_err(|error| self.invalid(format!("invalid name: {error}")))?;
-            if !entry.root.is_absolute() {
+            if !entry.root.is_absolute() || !entry.index_dir.is_absolute() {
                 return Err(self.invalid("workspace roots must be absolute"));
             }
-            if !roots.insert(&entry.root) {
-                return Err(self.invalid("workspace roots must be unique"));
+            if !roots.insert((&entry.root, &entry.index_dir)) {
+                return Err(self.invalid("workspace locations must be unique"));
             }
         }
         Ok(document)
@@ -220,15 +217,40 @@ fn existing_or_absolute_root(root: &Path) -> EngineResult<PathBuf> {
     }
 }
 
-fn vanished_root(previous: Option<&Path>, current: &Path) -> EngineResult<Option<PathBuf>> {
-    let Some(previous) = previous.filter(|path| *path != current) else {
-        return Ok(None);
-    };
-    if previous
-        .try_exists()
-        .map_err(|error| EngineError::from_io("inspect previous workspace root", &error))?
-    {
-        return Ok(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registrations_keep_one_binding_per_home_and_prune_vanished_homes() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root_a = directory.path().join("source-a");
+        let root_b = directory.path().join("source-b");
+        let first = directory.path().join("index-a");
+        let second = directory.path().join("index-b");
+        for path in [&root_a, &root_b, &first, &second] {
+            fs::create_dir(path).expect("directory");
+        }
+        let registry =
+            WorkspaceRegistry::at(directory.path().join("registry.json")).expect("registry");
+        registry
+            .remember("a", &root_a, &first)
+            .expect("first binding");
+        registry
+            .remember("a", &root_a, &second)
+            .expect("second index for same root");
+        assert_eq!(registry.read().expect("read").workspaces.len(), 2);
+        registry
+            .remember("b", &root_b, &first)
+            .expect("relocated source");
+        let entries = registry.read().expect("read").workspaces;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.iter().filter(|entry| entry.name == "a").count(), 1);
+        assert_eq!(entries.iter().filter(|entry| entry.name == "b").count(), 1);
+        fs::remove_dir(second).expect("remove vanished home");
+        registry.remember("b", &root_b, &first).expect("prune");
+        let entries = registry.read().expect("read").workspaces;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "b");
     }
-    existing_or_absolute_root(previous).map(Some)
 }

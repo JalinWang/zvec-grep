@@ -51,7 +51,7 @@ operation envelope, adapter registry or Core layer between a method and its
 implementation.
 
 Request and reply types are grouped under the matching method name in
-`zg_engine::api` (`context`, `index`, `info`, and `content`). Each group exposes its primary
+`zg_engine::api` (`context`, `index`, and `info`). Each group exposes its primary
 `Options` and `Result` types directly and keeps secondary types under `options`,
 `result`, or `progress`.
 
@@ -112,7 +112,9 @@ workspace discovery, `info`, and idempotent `drop_index`.
 For isolated runs, set `ZVEC_GREP_CONFIG` to a dedicated configuration file,
 `ZVEC_GREP_WORKSPACE_REGISTRY` to a dedicated registry file, `ZVEC_GREP_HOME` to a
 runtime directory, and `ZVEC_GREP_MODEL_CACHE` (or `--model-cache`) to a model cache.
-Workspace indexes live in each source root's `.zvec-grep/index/` directory. Rebuilds use `.zvec-grep/temp/` until publication; generation IDs remain metadata rather than directory names. Existing
+Workspace indexes default to each source root's `.zvec-grep/index/` directory.
+`--index-dir PATH` selects the complete workspace data directory and overrides
+`ZVEC_GREP_INDEX_DIR`. Rebuilds use that directory's `temp/` until publication; generation IDs remain metadata rather than directory names. Existing
 model caches may be reused without changing the user's regular configuration.
 
 On Unix, the CLI raises its own open-file soft limit toward 4096, capped by the
@@ -167,11 +169,28 @@ Query input and target kind are independent. Use `zg --vector 'a red bicycle'
 WebP file and cannot be combined with text queries. Positional queries remain
 literal text even if they name an existing file. The target table's model must
 support the query's input kind. Without `--kind`, all compatible enabled targets are
-searched. A pure vector query can combine comparable embedding spaces; other
-results are grouped by kind, each with its own ranking. Full-text/hybrid scores
-are never compared across tables. `--limit` is a total cap from 1 to 2000 (default 30), allocated
-round-robin across groups in text/code/image order. `--trace` explains targets,
-models and grouping; `--json` preserves paths, previews, target outcomes and result
+searched. Text/code candidates are combined before query fusion and rule ranking.
+Full-text-only queries combine both kinds using the fixed FTS configuration,
+even when their embedding models differ. Native BM25 scores are compared directly;
+this accepts the backend's local corpus statistics rather than claiming the
+scores equal a single globally scored corpus.
+
+Queries with vector routes combine text/code tables only when their model,
+dimension, metric, fixed weights and query encoding are compatible. This also
+applies to hybrid queries: full-text recall is pooled within that compatible
+group. Different query instructions, such as Gemma2's text and code instructions,
+keep groups separate. Each recall route is ordered across its participating
+tables before fusion; rule ranking then considers the complete recalled pool,
+including for single-vector text/code queries. Image results remain separately
+ranked without text/code rules. Scores are not probabilities; text/code scores
+include rule adjustments, while traces retain the original recall scores.
+
+Without `--fuse`, queries are ranked separately before query-group coverage and
+selection; with it, their recall routes are fused before rule ranking. The flag
+does not force incompatible models into one relevance ranking. `--limit` is a
+total cap from 1 to 2000 (default 30), allocated round-robin across the resulting
+groups in text/code/image order. `--trace` explains targets, models, shared recall
+and rule ranking; `--json` preserves paths, previews, target outcomes and result
 groups. `--status --json` shows effective tables and per-kind entity counts.
 Images return their path, format and encoded size. Public content-snapshot reading
 is not exposed; internal entity snapshots remain part of the index.
@@ -194,16 +213,52 @@ internal directories. The full MCP toolset uses the same argument parser and
 engine. PCRE2, compressed-file search, explicit encoding selection, and native
 ripgrep output-format switches are rejected; Unicode BOM decoding is automatic.
 
-Workspace settings live in `.zvec-grep/manifest.json`; `index/` holds the active
-storage and rebuilds use a temporary `temp/` directory. Copy the source tree with
-its entire `.zvec-grep` directory to retain the index and settings. No global
-workspace registration is required. Global configuration remains an optional
+Workspace settings live in `<index-dir>/manifest.json`; `index/` holds the active
+storage and rebuilds use a temporary `temp/` directory. The default is
+`<root>/.zvec-grep`. The manifest records the source root relative to the index
+directory, while stored file paths are relative to the source root. An explicit
+`--index-dir` selects that exact index; a missing index is an error. Without an
+explicit directory or `ZVEC_GREP_INDEX_DIR`, queries discover the closest default
+index upwards from the working directory. CLI relative arguments, including
+`--input`, resolve against the caller's working directory, independently of the
+saved source root. There is no query `--root` option.
+
+```sh
+zg --index ./materials --index-dir ./indexes/interior --embedding local/embeddinggemma-2
+zg "bright living room" --index-dir ./indexes/interior --kind image
+zg --status --index-dir ./indexes/interior
+```
+
+Stop writers and watchers, then copy the source tree and complete index directory
+while retaining their relative layout. On the destination, selecting the copied
+index also resolves the copied source tree; no registration or re-embedding is
+needed solely because the package moved. Source/index layouts on different Windows
+drives are rejected because they cannot preserve a relative relationship.
+To change that relationship explicitly, run `zg --index <new-source> --index-dir
+<index>`; this synchronizes the index, including removals. Omitting the source when
+updating an existing index uses its saved location. Missing or unreadable source
+roots fail indexed operations instead of switching to the caller's directory.
+`--rg` remains independent of the index and can still scan available files.
+Direct queries default to no refresh; server queries retain background refresh.
+`--refresh off` does not stop a watcher activated by an earlier operation.
+A failed or incomplete scan must not be treated as an empty source tree.
+
+No global workspace registration is required. MCP search/index/status/drop accept
+`indexDir`, an absolute server-visible path, without repeating `root`; it overrides
+the server's startup `ZVEC_GREP_INDEX_DIR`. Creating a new index requires `root`.
+Without `indexDir`, `root` supplies the default-index discovery starting point.
+Different index directories for the same source have separate
+resident jobs and watcher state. One index directory cannot be concurrently
+attached to different source roots. Global configuration remains an optional
 source of initial defaults and credentials; model assets may still use a shared
-cache or need downloading.
+cache or need downloading. Device and model-cache paths are machine-local: they
+are not saved in the manifest and resolve from request options, environment, local
+configuration, then defaults. Old development indexes require `--rebuild`; index
+version remains 2 and no development-schema migration is provided.
 
 An explicit `zg --index --api-key <key>` saves the default remote model's key,
 encrypted with XChaCha20-Poly1305. The ciphertext is in the manifest and the
-random encryption key is `.zvec-grep/credentials.key`. Repeat the command to
+random encryption key is `<index-dir>/credentials.key`. Repeat the command to
 replace it; an omitted key preserves the saved value. Environment and global
 configuration keys are used without being copied into the workspace. A query's
 `--api-key` is temporary. Failed/cancelled builds do not replace saved credentials.
@@ -237,7 +292,7 @@ Without `--embedding`, grant uses the existing index model, then
 `ZVEC_GREP_EMBEDDING`, then the configured default model. `--endpoint` overrides
 the stored index endpoint, per-model endpoint configuration, `ZVEC_GREP_ENDPOINT`,
 and provider default. The signed grant at
-`.zvec-grep/authorization.json` binds the canonical workspace root, model, and
+`<index-dir>/authorization.json` binds the canonical workspace root, model, and
 endpoint. Changing any of them requires a new grant. The signing key lives at
 `$ZVEC_GREP_HOME/authorization.key` (default `~/.zvec-grep/authorization.key`),
 or the path selected by `ZVEC_GREP_AUTHORIZATION_KEY_FILE`. This signing key stays

@@ -23,6 +23,7 @@ fn make_policy(
             ..ScanRulesUpdate::default()
         }
         .apply(options)?,
+        None,
     )
 }
 
@@ -50,6 +51,7 @@ async fn scan(
                         }
                         .apply(options)
                         .expect("scan rules"),
+                        None,
                     )
                     .expect("policy"),
                 ],
@@ -411,6 +413,26 @@ fn large_ignore_files_fail_explicitly_instead_of_unbounded_compilation() {
 }
 
 #[test]
+fn explicit_ignore_files_are_required_even_without_files_or_with_whitelist_globs() {
+    let temporary = tempfile::tempdir().expect("fixture");
+    let root = temporary.path().join("source");
+    fs::create_dir(&root).expect("empty source root");
+    let missing = temporary.path().join("required.ignore");
+    let rules = ScanRulesUpdate {
+        ignore_files: Some(vec![missing]),
+        ..ScanRulesUpdate::default()
+    }
+    .apply(&ScanRules::default())
+    .expect("scan rules");
+    let error = make_policy(&root, &[], &rules).expect_err("empty root still needs its rules");
+    assert!(error.message().contains("required.ignore"));
+    write(&root, "main.rs", "source");
+    let error = make_policy(&root, &["*.rs".into()], &rules)
+        .expect_err("whitelisted files must not bypass invalid scan configuration");
+    assert!(error.message().contains("required.ignore"));
+}
+
+#[test]
 fn external_ignore_aliases_match_canonical_change_events() {
     let temporary = tempfile::tempdir().expect("fixture");
     let base = fs::canonicalize(temporary.path()).expect("canonical fixture");
@@ -433,12 +455,18 @@ fn external_ignore_aliases_match_canonical_change_events() {
     assert!(policy.control_paths().contains(&rules));
     assert!(!policy.can_descend(&root.join("blocked")).expect("excluded"));
     fs::remove_file(&rules).expect("delete rules");
-    assert_eq!(
-        policy
-            .control_file_changed(&rules)
-            .expect("canonical event"),
-        Some(PathBuf::new())
-    );
+    let error = policy
+        .control_file_changed(&rules)
+        .expect_err("deleted explicit rules fail at invalidation");
+    assert!(error.to_string().contains("rules.ignore"));
+    let error = policy
+        .can_descend(&root.join("blocked"))
+        .expect_err("deleted explicit rules must not silently broaden the scan");
+    assert!(error.to_string().contains("rules.ignore"));
+    fs::write(&rules, "").expect("restore explicit ignore file");
+    policy
+        .control_file_changed(&rules)
+        .expect("restored rules event");
     assert!(policy.can_descend(&root.join("blocked")).expect("included"));
 }
 

@@ -26,6 +26,7 @@ const IGNORE_NAMES: [&str; 3] = [".gitignore", ".ignore", ".rgignore"];
 #[derive(Debug)]
 pub(crate) struct ScanPolicy {
     root: PathBuf,
+    index_home: Option<PathBuf>,
     options: ScanRules,
     ignore_files: Vec<PathBuf>,
     matcher: GlobMatcher,
@@ -42,7 +43,11 @@ struct IgnoreCache {
 }
 
 impl ScanPolicy {
-    pub(crate) fn new(root: &Path, options: &ScanRules) -> EngineResult<Self> {
+    pub(crate) fn new(
+        root: &Path,
+        options: &ScanRules,
+        index_home: Option<&Path>,
+    ) -> EngineResult<Self> {
         let matcher = GlobMatcher::new(root, options.globs())?;
         let ignore_files: Vec<_> = options
             .ignore_files()
@@ -61,8 +66,9 @@ impl ScanPolicy {
                 .map_err(|error| ignore_error(&error))?;
         }
         let control_paths = control_paths(root, options.use_default_ignores(), &ignore_files);
-        Ok(Self {
+        let policy = Self {
             root: root.to_path_buf(),
+            index_home: index_home.map(Path::to_path_buf),
             options: options.clone(),
             ignore_files,
             matcher,
@@ -70,11 +76,19 @@ impl ScanPolicy {
             control_paths: Mutex::new(control_paths),
             cache: Mutex::new(IgnoreCache::default()),
             repositories: Mutex::new(HashMap::new()),
-        })
+        };
+        policy
+            .load_explicit_rules()
+            .map_err(|error| EngineError::invalid_argument(error.to_string()))?;
+        Ok(policy)
     }
 
-    pub(crate) fn root_spec(root: &Path, options: &ScanRules) -> EngineResult<RootSpec> {
-        let policy = Arc::new(Self::new(root, options)?);
+    pub(crate) fn root_spec(
+        root: &Path,
+        options: &ScanRules,
+        index_home: Option<&Path>,
+    ) -> EngineResult<RootSpec> {
+        let policy = Arc::new(Self::new(root, options, index_home)?);
         let mut spec = RootSpec::new(root.to_path_buf(), policy);
         spec.follow = options.follow_symlinks();
         spec.max_depth = options.max_depth();
@@ -83,6 +97,13 @@ impl ScanPolicy {
     }
 
     fn selected(&self, path: &Path, directory: bool) -> Result<bool, HostError> {
+        if self
+            .index_home
+            .as_ref()
+            .is_some_and(|home| is_within_index(path, home))
+        {
+            return Ok(false);
+        }
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return Ok(false);
         };
@@ -110,6 +131,12 @@ impl ScanPolicy {
     }
 
     fn selected_entry(&self, absolute: &Path, directory: bool) -> Result<bool, HostError> {
+        if directory
+            && absolute != self.root
+            && crate::workspace::layout::is_workspace_data_directory(absolute)
+        {
+            return Ok(false);
+        }
         if !self.matches_rules(absolute, directory)? {
             return Ok(false);
         }
@@ -209,6 +236,13 @@ impl ScanPolicy {
         Ok(nested)
     }
 
+    fn load_explicit_rules(&self) -> Result<(), HostError> {
+        for file in &self.ignore_files {
+            self.rules(file, true)?;
+        }
+        Ok(())
+    }
+
     fn rules(&self, path: &Path, explicit: bool) -> Result<Arc<Gitignore>, HostError> {
         if let Some(value) = self
             .cache
@@ -260,7 +294,7 @@ impl ScanPolicy {
                         })?;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {}
             Err(error) => {
                 return Err(HostError::storage_failure(
                     "file-selection",
@@ -393,7 +427,7 @@ impl PathPolicy for ScanPolicy {
             self.options.use_default_ignores(),
             &self.ignore_files,
         );
-        Ok(())
+        self.load_explicit_rules()
     }
 }
 
@@ -498,3 +532,8 @@ const DEFAULT_IGNORED_FILE_PATTERNS: [&str; 19] = [
     "*.g.*",
     "*.gif",
 ];
+
+/// Includes symlink aliases of a data directory.
+pub(crate) fn is_within_index(path: &Path, home: &Path) -> bool {
+    path.starts_with(home) || std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(home))
+}

@@ -96,8 +96,8 @@ fn kind_groups_preserve_engine_order_instead_of_globally_sorting_ranks() {
     value["diagnostics"]["index"] = serde_json::json!({
         "input_kind":"text", "targets":[], "incomplete":false, "limit":30,
         "hits_returned":2, "query_groups":[], "routes":[], "result_groups":[
-        {"id":"text", "kinds":["text"], "model_refs":["fixture/text"], "scoring":"hybrid", "item_start":0, "item_count":1},
-        {"id":"code", "kinds":["code"], "model_refs":["fixture/code"], "scoring":"hybrid", "item_start":1, "item_count":1},
+        {"id":"text", "kinds":["text"], "model_refs":["fixture/text"], "scoring":"hybrid", "rule_ranking":true, "item_start":0, "item_count":1},
+        {"id":"code", "kinds":["code"], "model_refs":["fixture/code"], "scoring":"hybrid", "rule_ranking":true, "item_start":1, "item_count":1},
     ]});
     let result: ContextResult = serde_json::from_value(value).expect("grouped result");
     let rendered = format_search_result(&result, SearchPreview::Short);
@@ -107,6 +107,34 @@ fn kind_groups_preserve_engine_order_instead_of_globally_sorting_ranks() {
     );
     assert!(rendered.contains("result group: text kinds=text"));
     assert!(rendered.contains("result group: code kinds=code"));
+    assert!(rendered.contains("scoring=rule recall=Hybrid merge=independent_kind"));
+    assert!(!rendered.contains("trace:"));
+
+    let mut merged = serde_json::to_value(result).expect("context");
+    merged["diagnostics"]["index"]["result_groups"] = serde_json::json!([
+        {"id":"text-code", "kinds":["text", "code"], "model_refs":["fixture/text"],
+         "scoring":"full_text", "rule_ranking":true, "item_start":0, "item_count":2}
+    ]);
+    let trace = serde_json::json!({
+        "recall":[], "fusion":{"rank":1,"score":0.01,"forced":false},
+        "final_selection":{"returned_by_limit":true,"cutoff_rank":2}
+    });
+    merged["items"][0]["trace"] = trace.clone();
+    let merged: ContextResult = serde_json::from_value(merged).expect("merged context");
+    let rendered = format_search_result(&merged, SearchPreview::Short);
+    assert!(
+        rendered.contains(
+            "kinds=text,code scoring=rule recall=FullText merge=shared_recall_then_rules"
+        )
+    );
+    let rendered_trace = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix("trace: "))
+        .expect("requested per-hit trace is displayed");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(rendered_trace).expect("trace JSON"),
+        trace
+    );
 }
 
 fn source_range_cases() -> Vec<McpSearchPresentationCase> {
@@ -285,7 +313,7 @@ async fn public_tool_preview_matches_node_without_changing_retrieval() {
             let server = ZvecGrepMcpServer::build_with_index_operations(Arc::new(ZvecGrep::new()), toolset, None, backend.clone());
             let tool = server.listed_tools().into_iter().find(|tool| tool.name == "zvec_grep_search").expect("search tool");
             assert_eq!(tool.input_schema["properties"]["preview"]["enum"], serde_json::json!(["short", "full"]));
-            assert!(!tool.input_schema["required"].as_array().expect("required fields").contains(&serde_json::json!("preview")));
+            assert!(!tool.input_schema.get("required").and_then(serde_json::Value::as_array).is_some_and(|required| required.contains(&serde_json::json!("preview"))));
             assert!(tool.description.as_deref().expect("description").contains("preview: \"full\""));
             let (server_io, client_io) = tokio::io::duplex(4096);
             let task = tokio::spawn(async move { server.serve(server_io).await.expect("server").waiting().await });
@@ -344,6 +372,13 @@ fn image_search_results_show_metadata_without_text_ranges_or_bytes() {
     };
     item.range = ContentRange::File;
     item.content_range = ContentRange::File;
+    result.diagnostics.index = Some(serde_json::from_value(serde_json::json!({
+        "input_kind":"image", "targets":[], "incomplete":false, "limit":30,
+        "hits_returned":1, "query_groups":[], "routes":[], "result_groups":[
+            {"id":"text", "kinds":["text"], "model_refs":["fixture/model"], "scoring":"vector", "rule_ranking":true, "item_start":0, "item_count":0},
+            {"id":"image", "kinds":["image"], "model_refs":["fixture/model"], "scoring":"vector", "rule_ranking":false, "item_start":0, "item_count":1}
+        ]
+    })).expect("leading empty group"));
     let text = format_search_result(&result, SearchPreview::Full);
     assert!(text.contains("image.png"));
     assert!(!text.contains("image.png:"));
@@ -351,4 +386,6 @@ fn image_search_results_show_metadata_without_text_ranges_or_bytes() {
     assert!(!text.contains("source:"));
     assert!(!text.contains("reference:"));
     assert!(!text.contains("generation"));
+    assert!(text.contains("result group: image kinds=image scoring=Vector"));
+    assert!(!text.contains("result group: text"));
 }

@@ -16,8 +16,8 @@ use crate::{
 };
 
 const BUILD_FILE: &str = "temp/build.json";
-const NEW_INDEX: &str = "temp/new-index";
-const OLD_INDEX: &str = "temp/old-index";
+const NEW_INDEX: &str = "temp/new";
+const OLD_INDEX: &str = "temp/old";
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceBuild {
@@ -35,7 +35,6 @@ impl WorkspaceBuild {
 struct BuildRecord {
     generation: String,
     name: String,
-    root: PathBuf,
     previous_manifest: Option<String>,
     had_index: bool,
     publishing: bool,
@@ -43,7 +42,7 @@ struct BuildRecord {
 
 impl BuildRecord {
     fn validate(&self) -> Result<(), EngineError> {
-        if Uuid::parse_str(&self.generation).is_err() || !self.root.is_absolute() {
+        if Uuid::parse_str(&self.generation).is_err() {
             return Err(EngineError::storage_failure(
                 "invalid workspace build ownership record",
             ));
@@ -93,6 +92,7 @@ fn recover_build_with(
     discard_invalid: bool,
     delete_storage: &impl Fn(&Path) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
+    super::layout::validate_storage_paths(home)?;
     let record = match read_record(home) {
         Ok(Some(record)) => record,
         Ok(None) => return Ok(()),
@@ -125,6 +125,10 @@ fn recover_build_with(
 
 /// Start a new attempt only after recovering the previous one.
 pub(crate) fn prepare_build(mut target: WorkspaceManifest) -> Result<WorkspaceBuild, EngineError> {
+    super::layout::ensure_workspace_home(&super::layout::workspace_index_location(
+        &target.workspace.root,
+        Some(&target.path),
+    )?)?;
     if has_build(&target.path) || target.path.join(OLD_INDEX).try_exists().map_err(build_io)? {
         return Err(EngineError::resource_busy(
             "recover the unfinished workspace build before starting another",
@@ -135,7 +139,6 @@ pub(crate) fn prepare_build(mut target: WorkspaceManifest) -> Result<WorkspaceBu
     let record = BuildRecord {
         generation: target.storage_generation.clone().expect("new generation"),
         name: target.workspace.name.clone(),
-        root: target.workspace.root.clone(),
         previous_manifest: read_optional(&target.path.join(WORKSPACE_MANIFEST_FILE))?
             .as_deref()
             .map(sha256_hex),
@@ -237,6 +240,7 @@ fn move_index(from: &Path, to: &Path) -> Result<(), EngineError> {
 }
 
 pub(crate) fn drop_build_storage(home: &Path) -> Result<(), EngineError> {
+    super::layout::validate_storage_paths(home)?;
     IndexStore::delete(&home.join("index"))?;
     IndexStore::delete(&home.join(OLD_INDEX))?;
     cleanup_stage(home, &IndexStore::delete)?;
@@ -269,10 +273,8 @@ fn cleanup_stage(
     }
 }
 
-pub(crate) fn read_build_registration(
-    home: &Path,
-) -> Result<Option<(String, PathBuf)>, EngineError> {
-    Ok(read_record(home)?.map(|build| (build.name, build.root)))
+pub(crate) fn read_build_registration(home: &Path) -> Result<Option<String>, EngineError> {
+    Ok(read_record(home)?.map(|build| build.name))
 }
 
 fn read_record(home: &Path) -> Result<Option<BuildRecord>, EngineError> {
@@ -364,10 +366,11 @@ mod tests {
     }
 
     fn manifest(root: &Path) -> WorkspaceManifest {
+        let root = fs::canonicalize(root).expect("canonical fixture root");
         let mut manifest = WorkspaceManifest::new(
             Workspace {
                 name: "workspace".to_owned(),
-                root: root.to_path_buf(),
+                root: root.clone(),
                 scan: crate::domain::ScanRules::default(),
                 index: IndexState::Enabled(Box::new(
                     IndexDescriptor::new(
@@ -411,6 +414,7 @@ mod tests {
     fn write_active(manifest: &WorkspaceManifest) {
         fs::create_dir_all(manifest.index_path()).expect("active storage");
         fs::write(manifest.index_path().join("old"), "old data").expect("old data");
+        fs::write(manifest.index_path().join("schema.json"), br#"{"tables":[{"kind":"text","embedding":{"model":{"provider":"local","name":"example"}}}]}"#).expect("owned storage metadata");
         write_workspace_manifest(&manifest.path, manifest).expect("active manifest");
     }
 
@@ -469,7 +473,14 @@ mod tests {
                 assert_eq!(active.index_path().join("old").exists(), had_index);
                 assert!(!active.index_path().join("new").exists());
                 assert_eq!(
-                    read_workspace_manifest(&active.path).expect("manifest"),
+                    read_workspace_manifest(
+                        &crate::workspace::layout::workspace_index_location(
+                            &active.workspace.root,
+                            Some(&active.path)
+                        )
+                        .expect("location")
+                    )
+                    .expect("manifest"),
                     had_index.then_some(active)
                 );
             }
@@ -520,9 +531,15 @@ mod tests {
         let build = stage(&active);
         publish_build_with(build.clone(), 3, &fail_cleanup)
             .expect("committed despite cleanup failure");
-        let mut committed = read_workspace_manifest(&active.path)
-            .expect("read")
-            .expect("manifest");
+        let mut committed = read_workspace_manifest(
+            &crate::workspace::layout::workspace_index_location(
+                &active.workspace.root,
+                Some(&active.path),
+            )
+            .expect("location"),
+        )
+        .expect("read")
+        .expect("manifest");
         assert_eq!(
             committed.storage_generation,
             build.target.storage_generation
@@ -539,7 +556,14 @@ mod tests {
         assert!(committed.index_path().join("new").exists());
         assert!(!committed.index_path().join("old").exists());
         assert_eq!(
-            read_workspace_manifest(&active.path).expect("read"),
+            read_workspace_manifest(
+                &crate::workspace::layout::workspace_index_location(
+                    &active.workspace.root,
+                    Some(&active.path)
+                )
+                .expect("location")
+            )
+            .expect("read"),
             Some(committed)
         );
     }
@@ -559,7 +583,7 @@ mod tests {
         let home = moved.join(".zvec-grep");
         assert_eq!(
             read_build_registration(&home).expect("registration"),
-            Some((active.workspace.name, active.workspace.root))
+            Some(active.workspace.name)
         );
         recover_build(&home).expect("recover relocated index");
         assert!(home.join("index/old").exists());

@@ -299,7 +299,7 @@ fn primary_key(namespace: &str, value: &str) -> String {
 }
 
 pub(super) fn fragment_collection_name(kind: ContentKind) -> String {
-    format!("fragments_{}", kind.as_str())
+    kind.as_str().to_owned()
 }
 
 fn identity_schema(name: &str) -> EngineResult<CollectionSchema> {

@@ -117,20 +117,24 @@ fn write_indexed_items(
             diagnostics
                 .result_groups
                 .iter()
-                .find(|group| group.item_start == index)
+                .find(|group| group.item_count > 0 && group.item_start == index)
         }) {
             writeln!(
                 writer,
                 "{}",
                 heading(format!(
-                    "{} · {:?} · independently ranked",
+                    "{} · {} · independently ranked",
                     group
                         .kinds
                         .iter()
                         .map(|kind| kind.as_str())
                         .collect::<Vec<_>>()
                         .join(" + "),
-                    group.scoring
+                    if group.rule_ranking {
+                        "rule-ranked".to_owned()
+                    } else {
+                        format!("{:?}", group.scoring)
+                    }
                 ))
             )?;
         }
@@ -232,7 +236,7 @@ fn write_index_diagnostics(
             for group in &index.result_groups {
                 writeln!(
                     writer,
-                    "group: {} kinds={} models={} scoring={:?} merge={}; ranked within group",
+                    "group: {} kinds={} models={} scoring={} recall={:?} merge={}; ranked within group",
                     group.id,
                     group
                         .kinds
@@ -241,9 +245,14 @@ fn write_index_diagnostics(
                         .collect::<Vec<_>>()
                         .join(","),
                     group.model_refs.join(","),
+                    if group.rule_ranking {
+                        "rule".to_owned()
+                    } else {
+                        format!("{:?}", group.scoring)
+                    },
                     group.scoring,
                     if group.kinds.len() > 1 {
-                        "compatible_vector_scores"
+                        "shared_recall_then_rules"
                     } else {
                         "independent_kind"
                     }
@@ -451,13 +460,17 @@ Examples:
   zg --install
 
 Environment:
-  ZVEC_GREP_HOME        Runtime and daemon state directory; Workspace indexes stay under <root>/.zvec-grep
+  ZVEC_GREP_INDEX_DIR   Complete workspace data directory; --index-dir wins
+  ZVEC_GREP_HOME        Runtime and daemon state directory; separate from workspace indexes
   ZVEC_GREP_MODE        Default client mode: direct, server, or auto
   ZVEC_GREP_EMBEDDING   Default model for new indexes and auth grant
   ZVEC_GREP_API_KEY     Embedding provider credential fallback
   ZVEC_GREP_SERVER_URL  MCP server URL used by CLI clients
 
 Run zg --help models or zg --help file-types for supported indexing capabilities.
+--index-dir overrides ZVEC_GREP_INDEX_DIR. Paths are relative to the command
+working directory. Existing indexes resolve their saved source directory relative
+to the index directory; --rg ignores index selection.
 Run zg --help environment for all variables, scopes, aliases, and precedence.
 Run zg --help search or zg --help <topic> for specific help.
 Use zg -h/--help for this page and zg -v/--version for the version."#;
@@ -479,11 +492,17 @@ Search modes:
   --hybrid <query>                  Add an explicit hybrid query
   --fts <query>                     Add an exact/lexical query
   --vector <query>                  Add a semantic/vector query
-  --fuse                            Fuse query groups within each target table
+  --fuse                            Fuse query groups within each compatible result group
   --rg                              Run exhaustive managed ripgrep
 
 Search scope:
+  --index-dir <path>               Exact index data directory; overrides ZVEC_GREP_INDEX_DIR
   --kind <text|code|image>           Search only this content kind; default: all supported targets
+
+Without an explicit index directory, search finds the nearest .zvec-grep upwards
+from the current directory. An explicit directory must contain an existing index.
+Its saved source location is independent of the query's working directory.
+--rg ignores index selection and scans its current directory or supplied paths.
 
 Result options:
   --limit <n>                       Total result cap, 1..2000 (default: 30); shared across groups
@@ -496,13 +515,19 @@ Result options:
                                     In direct mode, background warns and falls back to off
   --mode <direct|server|auto>       Select indexed query transport (default: auto)
 
+--refresh off does not stop an already active watcher; it prevents this request
+from scheduling an update.
+
 Input type and target kind are independent. Text can search image tables whose
 model supports text-to-image retrieval. Without --kind, all supported
 configured tables are searched. Unsupported paths are reported and skipped.
-Compatible vector results share a ranked group; other results stay grouped by
-content kind. Full-text and hybrid scores are never ranked across tables.
---limit is allocated one item per group in text/code/image order until exhausted;
-each group keeps its own ranking. Scores are retrieval scores, not probabilities.
+Text/code tables with compatible query encoding share vector recall; full-text
+recall with the same configuration can also be combined using approximate BM25
+scores from each table. Hybrid recall is fused before shared rule ranking.
+All text/code searches apply rule ranking; images keep vector ranking separately.
+Incompatible model/encoding groups stay separate. --limit is allocated one item
+per group in text/code/image order until exhausted; each group keeps its own
+ranking. Scores are retrieval or rule scores, not probabilities.
 
 Embedding runtime:
   --api-key <key>                   Embedding provider API key
@@ -531,6 +556,7 @@ Unicode BOM decoding is automatic. PCRE2, compressed search, explicit encoding,
 and options that replace rg's output format are not supported.
 
 Environment:
+  ZVEC_GREP_INDEX_DIR    Complete workspace data directory; --index-dir wins
   ZVEC_GREP_MODE         Default client mode: direct, server, or auto
   ZVEC_GREP_API_KEY      Embedding provider credential fallback
   ZVEC_GREP_ENDPOINT     Remote Embedding endpoint fallback
@@ -542,9 +568,11 @@ See zg --help environment for precedence and Server-mode scope."#;
 const INDEX_HELP: &str = r"Usage:
   zg --index [root] [options]
   zg --index [root] --rebuild [options]
+  zg --index [root] --index-dir <path> [options]
   zg --index [root] --drop [--yes]
 
 Index options:
+  --index-dir <path>               Complete workspace data directory; overrides ZVEC_GREP_INDEX_DIR
   --name <NAME>                     Set or rename the workspace label
   --rebuild                         Rebuild the existing index
   --drop                            Permanently remove the workspace index
@@ -573,9 +601,9 @@ Scan rules:
   -L, --follow[=true|false]          Follow symbolic links safely
   --reset-paths                     Clear inherited scanning settings
 
-The saved key is portable with the complete .zvec-grep directory. Environment and
+The saved key is portable with the complete index data directory. Environment and
 global configuration keys are not saved. Omit --api-key to keep a saved key;
-repeat it to replace the key after successful indexing. Keep .zvec-grep private.
+repeat it to replace the key after successful indexing. Keep the index directory private.
 
 Interactive remote indexing asks to allow once, allow for this workspace, or
 cancel. Non-interactive indexing requires --allow-remote or a workspace grant.
@@ -584,13 +612,22 @@ A new workspace name defaults to its root directory name. Names are labels;
 different roots may share a name. --name updates it after successful indexing
 while preserving file IDs and active storage. No global registration is required.
 
+An existing index uses its saved source directory when [root] is omitted.
+Supply [root] to create a new explicit --index-dir or to relocate its source.
+The source is saved relative to the index directory; cross-drive layouts that
+cannot be represented by a relative path are rejected. Move both directories
+together, keeping their relative layout, while no writers or watchers are active.
+Missing or unreadable source directories fail indexed operations; --rg still
+searches its current directory and requested paths without reading the index.
+
 Indexes text, code, PNG, JPEG and static WebP images. Each content kind selects
 one model. Unsupported default kinds are skipped; explicit unsupported models fail.
 Vector queries search enabled tables whose models support the query's input kind.
 Explicit zg --index requires a default model from --embedding <model>,
 ZVEC_GREP_EMBEDDING, or configuration when creating a new index.
-Text search automatically creates a missing index with a configured local model
-or local/potion-code-16m-v2, never a remote model. --input requires an existing index.
+Text search automatically creates a missing index only when no --index-dir or
+ZVEC_GREP_INDEX_DIR is selected, using a configured local model or
+local/potion-code-16m-v2, never a remote model. --input requires an existing index.
 
 Repeat --embedding to configure different kinds, for example:
   zg --index --embedding local/potion-code-16m-v2 --embedding image=local/embeddinggemma-2
@@ -617,11 +654,12 @@ Environment:
 See zg --help environment for precedence and Server-mode scope.";
 
 const STATUS_HELP: &str = r"Usage:
-  zg --status [root] [--mode <direct|server|auto>] [--check-ready] [--json]
+  zg --status [root] [--index-dir <path>] [--mode <direct|server|auto>] [--check-ready] [--json]
 
 Shows the workspace root and policy, effective model and entity count for each
 content-kind table, index state, refresh status, and suggested next action.
---json emits the complete structured status.
+--json emits the complete structured status. [root] is the default-index discovery
+starting point; --index-dir selects an exact index and its saved source location.
 
 --check-ready preserves the normal output and exits non-zero unless the
 Workspace index is ready.";
@@ -651,7 +689,9 @@ const AUTH_HELP: &str = r"Usage:
   zg --auth revoke [root]
 
 Manage the signed Remote Embedding grant stored in the Workspace under
-.zvec-grep/authorization.json. Workspace grants are shared by zg CLI and zg MCP.
+authorization.json in the selected index directory. Workspace grants are shared
+by zg CLI and zg MCP. --index-dir selects that directory; moving source roots or
+changing machines requires fresh remote authorization.
 
 --embedding selects the Remote Embedding model to authorize; it does not run
 embedding. If omitted, auth grant uses the existing Workspace index model, then
@@ -699,7 +739,8 @@ continue to use the daemon's internal administration endpoint.
 --check-ready exits non-zero unless the server is ready.
 
 Environment:
-  ZVEC_GREP_HOME               Runtime and daemon state directory; Workspace indexes stay under <root>/.zvec-grep
+  ZVEC_GREP_INDEX_DIR   Complete workspace data directory; --index-dir wins
+  ZVEC_GREP_HOME               Runtime and daemon state directory; separate from workspace indexes
   ZVEC_GREP_SERVER_URL         MCP server URL used by CLI clients
   ZVEC_GREP_SERVER_TOKEN       Server/client Bearer token
   ZVEC_GREP_SERVER_TOKEN_FILE  File containing the Server/client Bearer token
@@ -903,8 +944,9 @@ Qwen credential aliases:
 
 State and authorization:
   ZVEC_GREP_CONFIG                  Global configuration file override; use for isolated configurations
+  ZVEC_GREP_INDEX_DIR               Complete workspace index directory; --index-dir wins
   ZVEC_GREP_WORKSPACE_REGISTRY      Workspace-name registry file override
-  ZVEC_GREP_HOME                    Runtime and daemon state directory; Workspace indexes stay under <root>/.zvec-grep
+  ZVEC_GREP_HOME                    Runtime and daemon state directory; separate from workspace indexes
   ZVEC_GREP_AUTHORIZATION_KEY_FILE  Workspace grant signing-key file (advanced)
 
 Advanced:
@@ -928,7 +970,8 @@ Agent integration paths:
   VSCODE_APPDATA        Base directory for VS Code release channels
 
 Precedence:
-  Embedding runtime                 CLI > Workspace snapshot > Global config > Environment
+  Remote endpoint/credential      CLI > Workspace snapshot > Global config > Environment
+  Local device/model cache        CLI > Environment > Global config > Default
   New-index model                  --embedding > ZVEC_GREP_EMBEDDING > Global config
   Client mode                      --mode > ZVEC_GREP_MODE > Global config
   Qwen environment credential      ZVEC_GREP_API_KEY > DASHSCOPE_API_KEY > QWEN_API_KEY
@@ -1066,7 +1109,7 @@ mod output_tests {
         item.range = ContentRange::File;
         item.content_range = ContentRange::File;
         item.excerpt_range = None;
-        let result = ContextResult {
+        let mut result = ContextResult {
             query: "image:input.png".into(),
             freshness: None,
             background_refresh: None,
@@ -1078,6 +1121,13 @@ mod output_tests {
             group_results: vec![],
             diagnostics: ContextDiagnostics::default(),
         };
+        result.diagnostics.index = Some(serde_json::from_value(serde_json::json!({
+            "input_kind":"image", "targets":[], "incomplete":false, "limit":30,
+            "hits_returned":1, "query_groups":[], "routes":[], "result_groups":[
+                {"id":"text", "kinds":["text"], "model_refs":["fixture/model"], "scoring":"vector", "rule_ranking":true, "item_start":0, "item_count":0},
+                {"id":"image", "kinds":["image"], "model_refs":["fixture/model"], "scoring":"vector", "rule_ranking":false, "item_start":0, "item_count":1}
+            ]
+        })).expect("leading empty group"));
         let mut output = Vec::new();
         write_context_with_options(&mut output, &result, OutputOptions::default(), false)
             .expect("render");
@@ -1087,6 +1137,8 @@ mod output_tests {
         assert!(!text.contains("entity:"));
         assert!(!text.contains("generation:"));
         assert!(!text.contains("picture.png:"));
+        assert!(text.contains("image · Vector · independently ranked"));
+        assert!(!text.contains("text · rule-ranked"));
     }
 
     #[test]

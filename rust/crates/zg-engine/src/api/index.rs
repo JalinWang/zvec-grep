@@ -21,6 +21,9 @@ pub mod options {
         pub name: Option<String>,
         /// Workspace whose index is being updated. `None` uses the working directory.
         pub root: Option<PathBuf>,
+        /// Exact workspace data directory. Absent uses `.zvec-grep` discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub index_dir: Option<PathBuf>,
         /// Build from empty storage and replace the active index only after success.
         pub rebuild: bool,
         /// Resets saved scan rules before applying this request's updates.

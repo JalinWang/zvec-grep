@@ -86,6 +86,7 @@ pub fn index_options(root: &Path) -> IndexOptions {
 pub fn info_options(root: &Path) -> InfoOptions {
     InfoOptions {
         root: Some(root.to_path_buf()),
+        index_dir: None,
         include_status: true,
     }
 }
@@ -97,8 +98,7 @@ pub fn configure_remote_model(root: &Path, address: SocketAddr) -> std::io::Resu
     // keeps one globally unique name, including when its root is later moved.
     let name = format!("fixture-{}", uuid::Uuid::new_v4());
     let manifest = json!({
-        "name": name, "path": home,
-        "root": root, "scan": {},
+        "format": "zg-workspace", "name": name, "sourceRoot": "..", "scan": {},
         "indexPolicy": "uninitialized", "defaultEmbeddingModel": null, "embeddingRoutes": {},
         "indexVersion": null, "createdTime": 1, "updatedTime": 1,
         "embeddingRuntimes": { "qwen/text-embedding-v4": { "endpoint": format!("http://{address}/embeddings") } }

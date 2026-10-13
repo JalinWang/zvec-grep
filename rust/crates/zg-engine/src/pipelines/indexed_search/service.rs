@@ -46,13 +46,16 @@ pub(crate) async fn context(
         std::path::absolute(options.root.as_deref().unwrap_or_else(|| Path::new(".")))
             .map_err(|error| EngineError::from_io("failed to resolve workspace root", &error))?;
     let request = normalize_context_request(options)?;
-    let Some(location) = find_nearest_workspace(&requested_root)? else {
+    let Some(location) = find_nearest_workspace(&requested_root, options.index_dir.as_deref())?
+    else {
         return Err(workspace_index_unavailable(
             &requested_root,
             "no workspace manifest was found",
         ));
     };
-    let initial_manifest = read_workspace_manifest(&location.home)?;
+    let initial_manifest = initial_query_manifest(&location)?;
+    validate_query_source(&location, initial_manifest.as_ref())?;
+    let _binding = crate::workspace::lock::bind_source(&location.home, &location.root)?;
     if let Some(manifest) = initial_manifest
         .as_ref()
         .filter(|manifest| is_indexed(manifest))
@@ -66,7 +69,10 @@ pub(crate) async fn context(
         && indexing.workspace_needs_refresh(&location, &wait).await?
     {
         indexing
-            .index(models, refresh_options(options, location.root.clone()))
+            .index(
+                models,
+                refresh_options(options, location.root.clone(), location.home.clone()),
+            )
             .await?;
     }
     let allows_writer = options.refresh.map_or(!options.auto_update, |policy| {
@@ -85,9 +91,10 @@ pub(crate) async fn context(
         }
         wait.retry(&location.home, "context").await?;
     };
-    let manifest = read_workspace_manifest(&location.home)?.ok_or_else(|| {
+    let manifest = read_workspace_manifest(&location)?.ok_or_else(|| {
         workspace_index_unavailable(&location.root, "workspace manifest disappeared")
     })?;
+    validate_query_source(&location, Some(&manifest))?;
     if manifest.workspace.index == IndexState::Disabled {
         return Err(EngineError::unsupported(format!(
             "workspace indexing is disabled at {}",
@@ -111,6 +118,7 @@ pub(crate) async fn context(
         Some(cache) => cache.acquire(&location.home, &manifest.index_path())?,
         None => ReadSessionLease::open(&manifest.index_path())?,
     };
+    storage.verify_source_root(&location.root)?;
     let result = query_storage(
         &acquired,
         &location.root,
@@ -126,6 +134,36 @@ pub(crate) async fn context(
     Ok(result)
 }
 
+fn validate_query_source(
+    location: &crate::workspace::layout::WorkspaceIndexLocation,
+    manifest: Option<&WorkspaceManifest>,
+) -> Result<(), EngineError> {
+    if manifest.is_some_and(|manifest| manifest.workspace.root != location.root) {
+        return Err(EngineError::resource_busy(
+            "workspace source directory changed; retry the query",
+        ));
+    }
+    crate::workspace::layout::validate_source_root(location)
+}
+
+fn initial_query_manifest(
+    location: &crate::workspace::layout::WorkspaceIndexLocation,
+) -> Result<Option<WorkspaceManifest>, EngineError> {
+    let initial_manifest = read_workspace_manifest(location)?;
+    if initial_manifest.is_none() && !crate::workspace::build::has_build(&location.home) {
+        if crate::workspace::build::has_index_storage(&location.home)? {
+            return Err(EngineError::storage_failure(
+                "index storage has no usable manifest; rebuild the index with `zg --index --rebuild`",
+            ));
+        }
+        return Err(workspace_index_unavailable(
+            &location.root,
+            "no workspace manifest was found in the selected index directory",
+        ));
+    }
+    Ok(initial_manifest)
+}
+
 async fn try_writer_context(
     indexing: &WorkspaceIndexService,
     models: &ModelRuntimeManager,
@@ -133,7 +171,7 @@ async fn try_writer_context(
     options: &ContextOptions,
     request: &super::context::NormalizedContextRequest,
 ) -> Result<Option<ContextResult>, EngineError> {
-    let Some(active) = read_workspace_manifest(&location.home)? else {
+    let Some(active) = read_workspace_manifest(location)? else {
         return Ok(None);
     };
     if !is_indexed(&active) {
@@ -146,6 +184,11 @@ async fn try_writer_context(
         return Ok(None);
     };
     let manifest = &writer.session.manifest;
+    if manifest.workspace.root != location.root {
+        return Err(EngineError::resource_busy(
+            "active writer uses a different source root",
+        ));
+    }
     for target in query_targets(&manifest.workspace, options, request)? {
         if target.skip_reason.is_some() {
             continue;
@@ -274,17 +317,21 @@ async fn query_storage(
 pub(in crate::pipelines) fn refresh_options(
     options: &ContextOptions,
     root: PathBuf,
+    index_dir: PathBuf,
 ) -> IndexOptions {
     IndexOptions {
         root: Some(root),
+        index_dir: Some(index_dir),
+        runtime_device: options.device,
+        model_cache: options.model_cache.clone(),
         // Refresh reconciles the active index against the whole source tree.
         changes: vec![crate::api::index::options::WorkspaceChange::Rescan],
         on_progress: options.on_progress.clone(),
         signal: options.signal.clone(),
         allow_remote: options.allow_remote,
         authorized_remote: options.authorized_remote.clone(),
-        // Refresh uses each model's persisted runtime configuration. Query-only
-        // endpoint, credentials and device overrides must not reconfigure other routes.
+        // Query-only endpoints and credentials do not reconfigure saved routes.
+        // Device and cache overrides remain local runtime settings.
         embedding_concurrency: options.embedding_concurrency,
         lock_timeout_ms: options.lock_timeout_ms,
         ..IndexOptions::default()
@@ -416,6 +463,7 @@ fn search_model_request(
         if authorize {
             crate::authorization::require_with_targets(
                 root,
+                Some(&manifest.path),
                 &reference,
                 &endpoint,
                 options.allow_remote,
@@ -441,15 +489,11 @@ fn search_model_request(
             },
             endpoint,
             device: if local {
-                crate::config::runtime_device(&config, &reference, options.device, runtime.device)?
+                crate::config::runtime_device(&config, &reference, options.device)?
             } else {
                 None
             },
-            cache_dir: crate::config::model_cache(
-                &config,
-                options.model_cache.clone(),
-                runtime.cache_dir.clone(),
-            ),
+            cache_dir: crate::config::model_cache(&config, options.model_cache.clone()),
         },
         embedding_concurrency,
     ))

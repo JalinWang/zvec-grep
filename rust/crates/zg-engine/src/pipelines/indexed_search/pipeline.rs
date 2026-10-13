@@ -76,7 +76,6 @@ pub(crate) struct SearchHit {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchPlanResult {
-    pub query_encoding: Option<QueryEncoding>,
     pub routes: Vec<ResolvedSearchRoute>,
     pub hits: Vec<SearchHit>,
     pub timings: Vec<TimingEntry>,
@@ -338,18 +337,139 @@ struct InternalEvidence {
     rank: usize,
 }
 
+#[cfg(test)]
 pub(crate) async fn search_workspace_index(
     workspace_root: &Path,
     plan: SearchPlan,
     storage: &dyn SearchStorage,
     embedding_models: &[&dyn SearchEmbeddingRuntime],
 ) -> Result<SearchPlanResult, EngineError> {
+    recall_workspace_index(workspace_root, plan, storage, embedding_models)
+        .await?
+        .finish(storage)
+}
+
+pub(super) struct RecalledSearch {
+    pub(super) query_encoding: Option<QueryEncoding>,
+    plan: SearchPlan,
+    routes: Vec<ResolvedSearchRoute>,
+    recall_routes: Vec<ResolvedSearchRoute>,
+    candidates: HashMap<EntityId, Candidate>,
+    timings: Vec<TimingEntry>,
+    pooled: bool,
+}
+
+impl RecalledSearch {
+    pub(super) fn merge(&mut self, other: Self) {
+        self.candidates.extend(other.candidates);
+        self.timings.extend(other.timings);
+        for route in other.recall_routes {
+            if !self.recall_routes.contains(&route) {
+                self.recall_routes.push(route);
+            }
+        }
+        self.pooled = true;
+    }
+
+    pub(super) fn finish(
+        mut self,
+        storage: &dyn SearchStorage,
+    ) -> Result<SearchPlanResult, EngineError> {
+        let limit = self.plan.limit.unwrap_or(DEFAULT_LIMIT);
+        let fusion_started = Instant::now();
+        if self.pooled {
+            self.rank_pooled_routes();
+        }
+        let rank_with_rules = self.plan.kind != ContentKind::Image;
+        let raw_scores = !rank_with_rules && self.routes.len() == 1;
+        let mut selected = fuse_candidates(self.candidates, raw_scores);
+        if !rank_with_rules {
+            selected.truncate(limit);
+        }
+        self.timings
+            .push(timing("fusion", fusion_started.elapsed()));
+
+        let load_started = Instant::now();
+        let mut hits = load_candidates(selected, limit, self.plan.trace, storage)?;
+        self.timings
+            .push(timing("load_results", load_started.elapsed()));
+        let ranking_started = Instant::now();
+        if rank_with_rules {
+            let maximum_rrf = self.recall_routes.iter().map(|_| 1.0 / (RRF_K + 1.0)).sum();
+            let ranking_routes = if self.plan.image.is_some() {
+                &[][..]
+            } else {
+                &self.routes
+            };
+            hits =
+                super::ranking::rank(hits, ranking_routes, &self.plan.filter, maximum_rrf, limit);
+        }
+        self.timings
+            .push(timing("ranking", ranking_started.elapsed()));
+        self.timings.push(TimingEntry {
+            name: "search_total".into(),
+            duration_micros: self.timings.iter().map(|entry| entry.duration_micros).sum(),
+            count: None,
+        });
+        Ok(SearchPlanResult {
+            routes: self.routes,
+            hits,
+            timings: self.timings,
+        })
+    }
+
+    fn rank_pooled_routes(&mut self) {
+        for route in &self.recall_routes {
+            let mut hits = self
+                .candidates
+                .values()
+                .flat_map(|candidate| &candidate.evidence)
+                .filter(|evidence| evidence.route_id == route.id)
+                .map(|evidence| &evidence.hit)
+                .collect::<Vec<_>>();
+            hits.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then_with(|| left.document_id.cmp(&right.document_id))
+            });
+            let ranks = hits
+                .into_iter()
+                .enumerate()
+                .map(|(index, hit)| (hit.document_id.clone(), index + 1))
+                .collect::<HashMap<_, _>>();
+            for candidate in self.candidates.values_mut() {
+                let mut best = None;
+                for evidence in &mut candidate.evidence {
+                    if evidence.route_id == route.id {
+                        evidence.rank = ranks[&evidence.hit.document_id];
+                        best =
+                            Some(best.map_or(evidence.rank, |rank: usize| rank.min(evidence.rank)));
+                    }
+                }
+                if let Some(rank) = best {
+                    for trace in &mut candidate.recall {
+                        if trace.route_id == route.id {
+                            trace.rank = Some(rank);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(super) async fn recall_workspace_index(
+    workspace_root: &Path,
+    plan: SearchPlan,
+    storage: &dyn SearchStorage,
+    embedding_models: &[&dyn SearchEmbeddingRuntime],
+) -> Result<RecalledSearch, EngineError> {
     if embedding_models.len() > 1 {
         return Err(EngineError::unsupported(
             "each query must select exactly one embedding model",
         ));
     }
-    let total_started = Instant::now();
     let plan_started = Instant::now();
     let routes = resolve_routes(&plan.routes)?;
     validate_modified_range(&plan)?;
@@ -410,43 +530,23 @@ pub(crate) async fn search_workspace_index(
     }
     let recall_duration = recall_started.elapsed();
 
-    let fusion_started = Instant::now();
-    let has_fts = routes
-        .iter()
-        .any(|route| route.mode == SearchRouteMode::Fts);
-    let rank_with_rules = plan.kind != ContentKind::Image && (plan.prefer_symbol || has_fts);
-    let raw_scores = !rank_with_rules && routes.len() == 1 && !plan.prefer_symbol;
-    let mut selected = fuse_candidates(candidates, raw_scores);
-    if !rank_with_rules {
-        selected.truncate(limit);
-    }
-    let fusion_duration = fusion_started.elapsed();
-
-    let load_started = Instant::now();
-    let mut hits = load_candidates(selected, limit, plan.trace, storage)?;
-    let load_duration = load_started.elapsed();
-    let ranking_started = Instant::now();
-    if rank_with_rules {
-        let recall_routes = build_recall_routes(&routes, filter.as_ref(), plan.prefer_symbol);
-        let maximum_rrf = recall_routes.iter().map(|_| 1.0 / (RRF_K + 1.0)).sum();
-        hits = super::ranking::rank(hits, &routes, &plan.filter, maximum_rrf, limit);
-    }
-    let ranking_duration = ranking_started.elapsed();
-
-    Ok(SearchPlanResult {
+    let recall_routes = build_recall_routes(&routes, filter.as_ref(), plan.prefer_symbol)
+        .into_iter()
+        .map(|route| route.route)
+        .collect();
+    Ok(RecalledSearch {
+        plan,
         query_encoding,
         routes,
-        hits,
+        recall_routes,
+        candidates,
         timings: vec![
             timing("search_plan", plan_duration),
             timing("search_filter", filter_duration),
             timing("query_embedding", embedding_duration),
             timing("recall", recall_duration),
-            timing("fusion", fusion_duration),
-            timing("load_results", load_duration),
-            timing("ranking", ranking_duration),
-            timing("search_total", total_started.elapsed()),
         ],
+        pooled: false,
     })
 }
 
@@ -1302,7 +1402,6 @@ mod tests {
         let definition_file = file(2, "src/core.ts", 100);
         let mut reference = entity(&reference_file, "vitest: Vitest");
         let mut definition = entity(&definition_file, "class Vitest {}");
-        let reference_id = reference.entity.id.clone();
         let definition_id = definition.entity.id.clone();
         for (stored, kind, name) in [
             (&mut reference, crate::domain::SymbolType::Value, "vitest"),
@@ -1365,15 +1464,14 @@ mod tests {
         let result = search_workspace_index(root.path(), request, &storage, &[&model])
             .await
             .expect("vector search");
-        assert_eq!(result.hits[0].entity.id, reference_id);
-        assert!((result.hits[0].score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(result.hits[0].entity.id, definition_id);
         assert!(
             result.hits[0]
                 .trace
                 .as_ref()
                 .expect("trace")
                 .ranking
-                .is_none()
+                .is_some()
         );
     }
 

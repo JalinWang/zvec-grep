@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Write, path::Path};
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -10,7 +6,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{EngineError, EngineResult, domain::model::Device, utils::sync_directory};
+use crate::{EngineError, EngineResult, utils::sync_directory};
 
 const KEY_FILE: &str = "credentials.key";
 
@@ -22,10 +18,6 @@ pub(crate) struct StoredModelConfig {
     pub api_key: Option<EncryptedApiKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<Device>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

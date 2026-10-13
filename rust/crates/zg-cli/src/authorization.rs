@@ -200,6 +200,7 @@ mod tests {
     #[test]
     fn image_prompt_discloses_image_and_cannot_fall_back_to_fts() {
         let target = IndexAuthorization {
+            index_dir: std::env::temp_dir().join(".zvec-grep"),
             root: std::env::temp_dir(),
             workspace_roots: vec![],
             model: "qwen/vision".into(),
@@ -225,6 +226,7 @@ mod tests {
     #[test]
     fn query_prompt_offers_fts_without_granting_remote_consent() {
         let target = IndexAuthorization {
+            index_dir: std::env::temp_dir().join(".zvec-grep"),
             root: std::env::temp_dir().join("docs"),
             workspace_roots: vec![std::env::temp_dir().join("docs")],
             model: "qwen/text-embedding-v4".into(),
@@ -266,6 +268,7 @@ mod tests {
     #[test]
     fn matches_legacy_prompt_and_requires_explicit_consent() {
         let target = IndexAuthorization {
+            index_dir: std::env::temp_dir().join(".zvec-grep"),
             root: "/workspace/docs".into(),
             workspace_roots: vec!["/workspace/docs".into()],
             model: "qwen/text-embedding-v4".into(),

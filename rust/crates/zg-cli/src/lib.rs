@@ -72,7 +72,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum CommandLine {
     /// Search indexed context or run managed ripgrep.
-    Query(QueryArgs),
+    Query(Box<QueryArgs>),
     /// Build, rebuild, or drop the workspace index.
     Index(IndexArgs),
     /// Show workspace and index status.
@@ -99,6 +99,9 @@ pub struct AuthArgs {
     pub action: AuthAction,
     #[arg(global = true)]
     pub root: Option<PathBuf>,
+    /// Complete workspace index data directory.
+    #[arg(long, global = true, env = "ZVEC_GREP_INDEX_DIR")]
+    pub index_dir: Option<PathBuf>,
     #[arg(long, global = true)]
     pub embedding: Option<String>,
     #[arg(long, global = true)]
@@ -459,6 +462,9 @@ fn ordered_glob_rules(matches: &clap::ArgMatches) -> Vec<GlobRule> {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct QueryArgs {
+    /// Complete workspace index data directory.
+    #[arg(long, env = "ZVEC_GREP_INDEX_DIR")]
+    pub index_dir: Option<PathBuf>,
     #[arg(long)]
     pub mode: Option<ClientMode>,
     #[arg(long = "force-direct")]
@@ -528,6 +534,9 @@ pub struct QueryArgs {
 #[allow(clippy::struct_excessive_bools)]
 pub struct IndexArgs {
     pub root: Option<PathBuf>,
+    /// Complete workspace index data directory.
+    #[arg(long, env = "ZVEC_GREP_INDEX_DIR")]
+    pub index_dir: Option<PathBuf>,
     /// Set or rename the workspace label; new workspaces default to the root directory name.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
@@ -572,6 +581,9 @@ pub struct IndexArgs {
 #[allow(clippy::struct_excessive_bools)]
 pub struct StatusArgs {
     pub root: Option<PathBuf>,
+    /// Complete workspace index data directory.
+    #[arg(long, env = "ZVEC_GREP_INDEX_DIR")]
+    pub index_dir: Option<PathBuf>,
     #[arg(long)]
     pub mode: Option<ClientMode>,
     #[arg(long = "check-ready")]
@@ -820,26 +832,29 @@ impl Cli {
     /// # Errors
     ///
     /// Returns [`CliError`] when options are incompatible.
-    pub fn into_plan(self, current_dir: PathBuf) -> Result<CliPlan, CliError> {
-        self.into_plan_with_terminal(current_dir, io::stdout().is_terminal())
+    pub fn into_plan(self, current_dir: impl AsRef<Path>) -> Result<CliPlan, CliError> {
+        self.into_plan_with_terminal(current_dir.as_ref(), io::stdout().is_terminal())
     }
 
     fn into_plan_with_terminal(
         self,
-        current_dir: PathBuf,
+        current_dir: &Path,
         terminal: bool,
     ) -> Result<CliPlan, CliError> {
         let Some(command) = self.command else {
             return Ok(CliPlan::Help(None));
         };
         match command {
-            CommandLine::Query(args) => query_plan(args, current_dir, terminal),
-            CommandLine::Index(args) => index_plan(args, &current_dir),
+            CommandLine::Query(args) => query_plan(*args, current_dir, terminal),
+            CommandLine::Index(args) => index_plan(args, current_dir),
             CommandLine::Status(args) => Ok(CliPlan::Status {
                 mode: resolve_client_mode(args.mode)?,
                 home: args.home,
                 request: InfoOptions {
-                    root: Some(resolve_from(&current_dir, args.root.as_deref())),
+                    root: Some(resolve_from(current_dir, args.root.as_deref())),
+                    index_dir: args
+                        .index_dir
+                        .map(|path| resolve_from(current_dir, Some(&path))),
                     include_status: true,
                 },
                 check_ready: args.check_ready,
@@ -859,7 +874,10 @@ impl Cli {
             CommandLine::Version => Ok(CliPlan::Version),
             CommandLine::Config(args) => Ok(CliPlan::Config(args)),
             CommandLine::Auth(mut args) => {
-                args.root = Some(resolve_from(&current_dir, args.root.as_deref()));
+                args.root = Some(resolve_from(current_dir, args.root.as_deref()));
+                args.index_dir = args
+                    .index_dir
+                    .map(|path| resolve_from(current_dir, Some(&path)));
                 Ok(CliPlan::Auth(args))
             }
             CommandLine::Install(args) => {
@@ -1117,6 +1135,7 @@ fn query_option_with_value(value: &str) -> bool {
             | "--symbol-type"
             | "--modified-after"
             | "--modified-before"
+            | "--index-dir"
             | "--home"
             | "--api-key"
             | "--model-cache"
@@ -1150,6 +1169,7 @@ fn query_attached_option(value: &str) -> bool {
         || value.starts_with("--symbol-type=")
         || value.starts_with("--modified-after=")
         || value.starts_with("--modified-before=")
+        || value.starts_with("--index-dir=")
         || value.starts_with("--home=")
         || value.starts_with("--api-key=")
         || value.starts_with("--model-cache=")
@@ -1303,7 +1323,7 @@ fn query_output(args: &QueryArgs, terminal: bool) -> OutputOptions {
 
 fn query_plan(
     mut args: QueryArgs,
-    current_dir: PathBuf,
+    current_dir: &Path,
     terminal: bool,
 ) -> Result<CliPlan, CliError> {
     let mode = resolve_query_mode(&args)?;
@@ -1341,7 +1361,7 @@ fn query_plan(
         ContextOptions {
             target_kind: args.target_kind,
             query_image: args.input.map(|path| QueryImage::Path {
-                path: resolve_from(&current_dir, Some(&path)),
+                path: resolve_from(current_dir, Some(&path)),
             }),
             queries,
             routes,
@@ -1366,7 +1386,7 @@ fn query_plan(
     request.device = args.device.map(Into::into);
     request.model_cache = args
         .model_cache
-        .map(|path| resolve_from(&current_dir, Some(&path)));
+        .map(|path| resolve_from(current_dir, Some(&path)));
     request.limit = args.limit;
     if request.rg {
         request.rg_options.modified_after_epoch_ms = args.modified_after;
@@ -1379,7 +1399,12 @@ fn query_plan(
     {
         return Err(CliError::InvalidModifiedRange);
     }
-    request.root = Some(current_dir);
+    request.root = Some(current_dir.to_path_buf());
+    if !request.rg {
+        request.index_dir = args
+            .index_dir
+            .map(|path| resolve_from(current_dir, Some(&path)));
+    }
     args.files.apply_context(&mut request)?;
     request.ignore_files = request
         .ignore_files
@@ -1464,9 +1489,12 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
     args.model_cache = args
         .model_cache
         .map(|path| resolve_from(current_dir, Some(&path)));
-    let root = resolve_from(current_dir, args.root.as_deref());
     let mode = resolve_client_mode(args.mode)?;
     let home = args.home.clone();
+    let index_dir = args
+        .index_dir
+        .as_ref()
+        .map(|path| resolve_from(current_dir, Some(path)));
     let output = OutputOptions {
         debug: args.debug,
         color: if args.no_color {
@@ -1499,7 +1527,8 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             mode,
             home,
             operation: IndexOperation::Drop(InfoOptions {
-                root: Some(root),
+                root: Some(resolve_from(current_dir, args.root.as_deref())),
+                index_dir,
                 include_status: false,
             }),
             output,
@@ -1513,12 +1542,28 @@ fn index_plan(mut args: IndexArgs, current_dir: &Path) -> Result<CliPlan, CliErr
             .collect()
     });
     let embeddings = parse_embeddings(&args)?;
+    let location = if let Some(root) = &args.root {
+        zg_engine::api::workspace::WorkspaceLocation::resolve(
+            Some(&resolve_from(current_dir, Some(root))),
+            index_dir.as_deref(),
+        )?
+    } else if index_dir.is_some() {
+        zg_engine::api::workspace::WorkspaceLocation::for_index(None, index_dir.as_deref())?
+    } else {
+        zg_engine::api::workspace::WorkspaceLocation::discover(Some(current_dir), None)?
+    };
     Ok(CliPlan::Index {
         mode,
         home,
         operation: IndexOperation::Build(Box::new(IndexOptions {
-            root: Some(root),
+            root: Some(location.root),
+            index_dir: Some(location.home),
             name: args.name,
+            changes: if args.root.is_none() {
+                vec![zg_engine::api::index::options::WorkspaceChange::Rescan]
+            } else {
+                Vec::new()
+            },
             rebuild: args.rebuild,
             reset_paths: args.reset_paths,
             scan,
@@ -1699,7 +1744,7 @@ mod tests {
     fn plan(arguments: &[&str], terminal: bool) -> CliPlan {
         Cli::try_parse_from(arguments.iter().copied())
             .expect("parse")
-            .into_plan_with_terminal(std::env::temp_dir(), terminal)
+            .into_plan_with_terminal(&std::env::temp_dir(), terminal)
             .expect("plan")
     }
 
@@ -2488,6 +2533,30 @@ mod tests {
         .expect("saved scan rules");
         let scan = args.update().apply(&scan).expect("updated scan rules");
         assert_eq!(scan.globs(), rules);
+    }
+
+    #[test]
+    fn query_paths_resolve_against_the_callers_working_directory() {
+        let cwd = std::env::temp_dir();
+        let CliPlan::Query { request, .. } = Cli::try_parse_from([
+            "zg",
+            "--input",
+            "query.png",
+            "--index-dir",
+            "indexes",
+            "--mode",
+            "direct",
+        ])
+        .expect("args")
+        .into_plan(cwd.clone())
+        .expect("plan") else {
+            panic!("query plan")
+        };
+        assert_eq!(request.root, Some(cwd.clone()));
+        assert_eq!(request.index_dir, Some(cwd.join("indexes")));
+        assert!(
+            matches!(request.query_image, Some(zg_engine::api::context::options::QueryImage::Path {path}) if path == cwd.join("query.png"))
+        );
     }
 
     #[test]

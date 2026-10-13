@@ -83,10 +83,10 @@ pub(crate) fn format_search_result(reply: &ContextResult, preview: SearchPreview
             index
                 .result_groups
                 .iter()
-                .find(|group| group.item_start == position)
+                .find(|group| group.item_count > 0 && group.item_start == position)
         }) {
             lines.push(format!(
-                "result group: {} kinds={} scoring={:?} merge={}; ranked within this group",
+                "result group: {} kinds={} scoring={} recall={:?} merge={}; ranked within this group",
                 group.id,
                 group
                     .kinds
@@ -94,9 +94,14 @@ pub(crate) fn format_search_result(reply: &ContextResult, preview: SearchPreview
                     .map(|kind| kind.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
+                if group.rule_ranking {
+                    "rule".to_owned()
+                } else {
+                    format!("{:?}", group.scoring)
+                },
                 group.scoring,
                 if group.kinds.len() > 1 {
-                    "compatible_vector_scores"
+                    "shared_recall_then_rules"
                 } else {
                     "independent_kind"
                 }
@@ -106,6 +111,12 @@ pub(crate) fn format_search_result(reply: &ContextResult, preview: SearchPreview
             lines.push(String::new());
         }
         append_item(&mut lines, item, preview);
+        if let Some(trace) = &item.trace {
+            lines.push(format!(
+                "trace: {}",
+                serde_json::to_string(trace).expect("search trace contains serializable fields")
+            ));
+        }
     }
     lines.join("\n")
 }

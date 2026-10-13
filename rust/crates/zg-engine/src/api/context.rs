@@ -79,6 +79,9 @@ pub mod options {
         pub fuse: bool,
         /// Workspace root. `None` uses the process working directory.
         pub root: Option<PathBuf>,
+        /// Exact workspace data directory. Absent uses `.zvec-grep` discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub index_dir: Option<PathBuf>,
         pub limit: Option<usize>,
         pub auto_update: bool,
         /// Explicit refresh policy; absent preserves the legacy auto-update behavior.
@@ -205,6 +208,7 @@ pub mod options {
                 routes: Vec::new(),
                 fuse: false,
                 root: None,
+                index_dir: None,
                 limit: None,
                 auto_update: true,
                 refresh: None,
@@ -684,7 +688,9 @@ pub mod result {
         pub id: String,
         pub kinds: Vec<crate::domain::ContentKind>,
         pub model_refs: Vec<String>,
+        /// Recall strategy; rule ranking may subsequently replace its scores.
         pub scoring: IndexScoring,
+        pub rule_ranking: bool,
         pub item_start: usize,
         pub item_count: usize,
     }

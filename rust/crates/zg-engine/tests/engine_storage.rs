@@ -158,11 +158,8 @@ async fn one_text_model_indexes_text_and_skips_images_without_embedding_them() -
     let collections = model_collections(&info.index_path)?;
     assert_eq!(collections.len(), 2);
     assert_vector_indexes_complete(&info.index_path)?;
-    assert_eq!(
-        native_documents(&info.index_path.join("fragments_text"))?.len(),
-        1
-    );
-    assert!(native_documents(&info.index_path.join("fragments_code"))?.is_empty());
+    assert_eq!(native_documents(&info.index_path.join("text"))?.len(), 1);
+    assert!(native_documents(&info.index_path.join("code"))?.is_empty());
     assert_eq!(
         native_documents(&info.index_path.join("entities"))?.len(),
         1
@@ -553,7 +550,7 @@ async fn long_entities_store_original_content_once_and_project_fragment_metadata
     assert_eq!(server.inputs.load(Ordering::Acquire), fragments.len());
     let collections = model_collections(&info.index_path)?;
     assert_eq!(collections.len(), 2);
-    let projected = native_documents(&info.index_path.join("fragments_code"))?;
+    let projected = native_documents(&info.index_path.join("code"))?;
     assert_eq!(projected.len(), fragments.len());
     let mut projected_ids = BTreeSet::new();
     for doc in projected {
@@ -1097,11 +1094,8 @@ async fn incremental_failure_removes_all_old_searchable_content_for_the_file() -
         [PathBuf::from("stable.txt")]
     );
     assert_eq!(native_documents(&index_path.join("entities"))?.len(), 1);
-    assert_eq!(
-        native_documents(&index_path.join("fragments_text"))?.len(),
-        1
-    );
-    assert!(native_documents(&index_path.join("fragments_code"))?.is_empty());
+    assert_eq!(native_documents(&index_path.join("text"))?.len(), 1);
+    assert!(native_documents(&index_path.join("code"))?.is_empty());
     let status = engine
         .info(info_options(root))
         .await?
@@ -1200,13 +1194,13 @@ async fn public_engine_recovers_pending_files_without_skipping_unchanged_sources
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name == "entities" || name.starts_with("fragments_"))
+                .is_some_and(|name| matches!(name, "entities" | "text" | "code" | "image"))
         })
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     assert_eq!(collections.len(), 3);
     for collection in collections {
-        if collection.ends_with("fragments_code") {
+        if collection.ends_with("code") {
             continue;
         }
         assert!(
@@ -1342,6 +1336,368 @@ async fn public_engine_reuses_relative_files_after_moving_workspace() -> TestRes
     Ok(())
 }
 
+fn external_query(root: &Path, home: &Path, query: &str) -> ContextOptions {
+    ContextOptions {
+        root: Some(root.to_path_buf()),
+        index_dir: Some(home.to_path_buf()),
+        routes: vec![ContextRoute {
+            mode: ContextRouteMode::Fts,
+            query: query.into(),
+        }],
+        auto_update: false,
+        ..ContextOptions::default()
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "verify portable relocation, explicit repair and incremental reuse"
+)]
+async fn external_storage_survives_bundle_moves_and_explicit_source_repair() -> TestResult {
+    let temporary = tempdir()?;
+    let original_bundle = temporary.path().join("original");
+    let original_root = original_bundle.join("materials");
+    let original_home = original_bundle.join("search-data");
+    fs::create_dir_all(original_root.join("rooms/客厅"))?;
+    let relative = Path::new("rooms/客厅/note.txt");
+    fs::write(
+        original_root.join(relative),
+        "Orchard portable interior notes.",
+    )?;
+    let server = EmbeddingServer::start()?;
+    let index = |root: &Path, home: &Path| IndexOptions {
+        index_dir: Some(home.to_path_buf()),
+        endpoint: Some(format!("http://{}/embeddings", server.address)),
+        ..index_options(root)
+    };
+    let info = |root: &Path, home: &Path| zg_engine::api::info::InfoOptions {
+        index_dir: Some(home.to_path_buf()),
+        ..info_options(root)
+    };
+    let engine = ZvecGrep::new();
+    engine.index(index(&original_root, &original_home)).await?;
+    assert!(!original_root.join(".zvec-grep").exists());
+    let before = engine
+        .context(external_query(&original_root, &original_home, "orchard"))
+        .await?;
+    let records = native_file_records(&original_home.join("index"))?;
+    let manifest: Value = serde_json::from_slice(&fs::read(original_home.join("manifest.json"))?)?;
+    assert!(manifest.get("root").is_none());
+    assert!(manifest.get("path").is_none());
+    assert_eq!(manifest["sourceRoot"], "../materials");
+    assert_eq!(before.items.len(), 1);
+    engine.close();
+    drop(engine);
+
+    let moved_bundle = temporary.path().join("relocated");
+    fs::rename(&original_bundle, &moved_bundle)?;
+    let moved_root = moved_bundle.join("materials");
+    let moved_home = moved_bundle.join("search-data");
+    let engine = ZvecGrep::new();
+    let moved = engine
+        .context(external_query(temporary.path(), &moved_home, "orchard"))
+        .await?;
+    assert_eq!(moved.items[0].preview, before.items[0].preview);
+    assert_eq!(moved.items[0].relative_path, relative);
+    assert_eq!(
+        moved.items[0].absolute_path,
+        fs::canonicalize(&moved_root)?.join(relative)
+    );
+    let renamed_root = moved_bundle.join("renamed-materials");
+    fs::rename(&moved_root, &renamed_root)?;
+    let error = engine
+        .context(external_query(&renamed_root, &moved_home, "orchard"))
+        .await
+        .expect_err("query cannot silently rebind a broken source relationship");
+    assert!(error.message().contains("source directory"));
+    let repaired = engine.index(index(&renamed_root, &moved_home)).await?;
+    assert_eq!(repaired.files_unchanged, 1);
+    let moved_root = renamed_root;
+    let source = moved_root.join(relative);
+    let changed_time = fs::metadata(&source)?.modified()? + std::time::Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(&source)?
+        .set_times(fs::FileTimes::new().set_modified(changed_time))?;
+    let calls = server.requests.load(Ordering::Acquire);
+    let refreshed = engine
+        .context(ContextOptions {
+            refresh: Some(zg_engine::api::context::options::RefreshPolicy::Wait),
+            allow_remote: true,
+            api_key: Some("local-test-key".into()),
+            ..external_query(&moved_root, &moved_home, "orchard")
+        })
+        .await?;
+    assert_eq!(refreshed.items.len(), 1);
+    assert_eq!(server.requests.load(Ordering::Acquire), calls);
+    let updated = native_file_records(&moved_home.join("index"))?;
+    let unchanged = engine
+        .index(IndexOptions {
+            root: None,
+            ..index(&moved_root, &moved_home)
+        })
+        .await?;
+    assert_eq!(
+        (
+            unchanged.files_unchanged,
+            unchanged.files_added,
+            unchanged.files_deleted
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(server.requests.load(Ordering::Acquire), calls);
+    assert_eq!(updated[0]["id"], records[0]["id"]);
+    assert_eq!(
+        updated[0]["relative_path"],
+        json!({"components": ["rooms", "客厅", "note.txt"]})
+    );
+    assert_ne!(
+        updated[0]["snapshot"]["modified_epoch_ms"],
+        records[0]["snapshot"]["modified_epoch_ms"]
+    );
+    let again = engine.index(index(&moved_root, &moved_home)).await?;
+    assert_eq!(again.files_unchanged, 1);
+    assert_eq!(server.requests.load(Ordering::Acquire), calls);
+    let after = engine
+        .context(external_query(&moved_root, &moved_home, "orchard"))
+        .await?;
+    assert_eq!(after.items[0].preview, before.items[0].preview);
+    assert_eq!(
+        engine
+            .info(info(&moved_root, &moved_home))
+            .await?
+            .index_path,
+        fs::canonicalize(&moved_home)?.join("index")
+    );
+
+    fs::remove_dir_all(&moved_root)?;
+    assert!(engine.drop_index(info(&moved_root, &moved_home)).await?);
+    assert!(!moved_home.join("index").exists());
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn independent_inside_source_indexes_never_ingest_each_other() -> TestResult {
+    use zg_engine::api::index::options::ScanRulesUpdate;
+
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let first = root.join("first-data");
+    let second = root.join("second-data");
+    let server = EmbeddingServer::start()?;
+    let engine = ZvecGrep::new();
+    fs::write(root.join("note.txt"), "Orchard public notes.")?;
+    let options = |home: &Path| IndexOptions {
+        index_dir: Some(home.to_path_buf()),
+        endpoint: Some(format!("http://{}/embeddings", server.address)),
+        scan: ScanRulesUpdate {
+            use_default_ignores: Some(false),
+            include_hidden: Some(true),
+            follow_symlinks: Some(true),
+            ..Default::default()
+        },
+        ..index_options(root)
+    };
+    assert_eq!(engine.index(options(&first)).await?.files_added, 1);
+    fs::write(first.join("private.txt"), "Orchard first index data.")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&first, root.join("first-alias"))?;
+    assert_eq!(engine.index(options(&second)).await?.files_added, 1);
+    fs::write(second.join("private.txt"), "Orchard second index data.")?;
+    let pending = root.join("interrupted-data");
+    fs::create_dir_all(pending.join("temp"))?;
+    fs::write(
+        pending.join("temp/build.json"),
+        serde_json::to_vec(&json!({
+            "generation": "3f53405e-c6c0-4e34-acfb-61caa1c5e457",
+            "name": "interrupted",
+            "previous_manifest": null,
+            "had_index": false,
+            "publishing": false
+        }))?,
+    )?;
+    fs::write(pending.join("private.txt"), "Orchard staged index data.")?;
+
+    for home in [&first, &second] {
+        let updated = engine.index(options(home)).await?;
+        assert_eq!((updated.files_unchanged, updated.files_added), (1, 0));
+        let result = engine
+            .context(external_query(root, home, "orchard"))
+            .await?;
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].relative_path, Path::new("note.txt"));
+    }
+    let direct = engine
+        .context(ContextOptions {
+            root: Some(root.to_path_buf()),
+            rg: true,
+            query: Some("Orchard".into()),
+            no_ignore: true,
+            hidden: true,
+            follow: true,
+            ..ContextOptions::default()
+        })
+        .await?;
+    assert_eq!(direct.items.len(), 1);
+    assert_eq!(direct.items[0].relative_path, Path::new("note.txt"));
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_index_watcher_observes_source_changes_and_retains_binding() -> TestResult {
+    let temporary = tempdir()?;
+    let root = temporary.path().join("materials");
+    let home = temporary.path().join("data");
+    let other = temporary.path().join("another-source");
+    fs::create_dir(&root)?;
+    fs::create_dir(&other)?;
+    fs::write(root.join("note.txt"), "Orchard source.")?;
+    let server = EmbeddingServer::start()?;
+    let engine = ZvecGrep::new();
+    engine
+        .index(IndexOptions {
+            index_dir: Some(home.clone()),
+            endpoint: Some(format!("http://{}/embeddings", server.address)),
+            ..index_options(&root)
+        })
+        .await?;
+    let control = zg_host_native::TaskControl::default();
+    let watcher = engine.watch_workspace(&root, Some(&home), &control).await?;
+    let other_info = zg_engine::api::info::InfoOptions {
+        index_dir: Some(home.clone()),
+        include_status: false,
+        ..info_options(&other)
+    };
+    assert_eq!(
+        engine.info(other_info.clone()).await?.root,
+        fs::canonicalize(&root)?
+    );
+    assert_eq!(
+        engine
+            .index(IndexOptions {
+                index_dir: Some(home),
+                ..index_options(&other)
+            })
+            .await
+            .expect_err("an active watcher prevents rebinding")
+            .code(),
+        EngineError::RESOURCE_BUSY
+    );
+    fs::write(root.join("note.txt"), "Vineyard changed source.")?;
+    let changes = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let batch = watcher.next_changes(&control).await?;
+            if batch.changes.iter().any(|change| {
+                matches!(change, zg_host_native::WorkspaceChange::Rescan)
+                    || matches!(change, zg_host_native::WorkspaceChange::Upsert(path) if path == Path::new("note.txt"))
+            }) {
+                return Ok::<_, zg_host_native::HostError>(batch);
+            }
+        }
+    }).await;
+    watcher.close().await?;
+    changes??;
+    assert!(engine.info(other_info).await?.indexed);
+    engine.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_storage_is_excluded_and_missing_explicit_storage_never_falls_back() -> TestResult
+{
+    use zg_engine::api::index::options::ScanRulesUpdate;
+
+    let temporary = tempdir()?;
+    let root = temporary.path();
+    let home = root.join("search-data");
+    fs::create_dir(&home)?;
+    fs::write(root.join("note.txt"), "Orchard public notes.")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&home, root.join("data-alias"))?;
+    let server = EmbeddingServer::start()?;
+    let engine = ZvecGrep::new();
+    let options = IndexOptions {
+        index_dir: Some(home.clone()),
+        endpoint: Some(format!("http://{}/embeddings", server.address)),
+        scan: ScanRulesUpdate {
+            use_default_ignores: Some(false),
+            include_hidden: Some(true),
+            follow_symlinks: Some(true),
+            ..Default::default()
+        },
+        ..index_options(root)
+    };
+    let indexed = engine.index(options.clone()).await?;
+    assert_eq!((indexed.files_added, indexed.files_failed), (1, 0));
+    fs::write(home.join("private.txt"), "Orchard internal index data.")?;
+    let updated = engine.index(options).await?;
+    assert_eq!(
+        (
+            updated.files_unchanged,
+            updated.files_added,
+            updated.files_failed
+        ),
+        (1, 0, 0)
+    );
+    let result = engine
+        .context(external_query(root, &home, "orchard"))
+        .await?;
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].relative_path, Path::new("note.txt"));
+    // A valid default index cannot rescue an explicitly missing or corrupt selection.
+    engine
+        .index(IndexOptions {
+            endpoint: Some(format!("http://{}/embeddings", server.address)),
+            scan: ScanRulesUpdate {
+                globs: Some(vec!["note.txt".into()]),
+                ..Default::default()
+            },
+            ..index_options(root)
+        })
+        .await?;
+    assert_eq!(
+        fts_paths(&engine, root, "orchard").await?,
+        [PathBuf::from("note.txt")]
+    );
+    let missing = root.join("missing-data");
+    assert!(
+        engine
+            .context(external_query(root, &missing, "orchard"))
+            .await
+            .is_err()
+    );
+    assert!(!missing.exists());
+    let corrupt = root.join("corrupt-data");
+    fs::create_dir(&corrupt)?;
+    fs::write(corrupt.join("manifest.json"), "{not valid JSON}")?;
+    assert!(
+        engine
+            .context(external_query(root, &corrupt, "orchard"))
+            .await
+            .is_err()
+    );
+    let wrong_home_info = engine
+        .info(zg_engine::api::info::InfoOptions {
+            index_dir: Some(missing),
+            ..info_options(root)
+        })
+        .await?;
+    assert!(!wrong_home_info.indexed);
+    assert_eq!(
+        engine
+            .context(external_query(root, &home, "orchard"))
+            .await?
+            .items
+            .len(),
+        1
+    );
+    engine.close();
+    Ok(())
+}
+
 async fn fts_paths(
     engine: &ZvecGrep,
     root: &Path,
@@ -1377,7 +1733,7 @@ fn model_collections(index_path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::err
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("fragments_"))
+                .is_some_and(|name| matches!(name, "text" | "code" | "image"))
         })
         .map(|entry| entry.path())
         .collect())

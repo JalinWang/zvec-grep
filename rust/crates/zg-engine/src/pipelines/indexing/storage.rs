@@ -19,6 +19,7 @@ pub(crate) trait IndexStorage: Send + Sync {
         entities: &[Entity],
         entries: &[IndexedFragment],
     ) -> EngineResult<()>;
+    fn update_file_snapshot(&self, file: &FileRecord) -> EngineResult<()>;
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> EngineResult<()>;
     fn delete_file(&self, file_id: FileId) -> EngineResult<()>;
     fn finalize_writes(&self) -> EngineResult<()>;
@@ -48,6 +49,10 @@ impl IndexStorage for IndexStore {
         entries: &[IndexedFragment],
     ) -> EngineResult<()> {
         self.replace_file(file, entities, entries)
+    }
+
+    fn update_file_snapshot(&self, file: &FileRecord) -> EngineResult<()> {
+        self.update_file_snapshot(file)
     }
 
     fn mark_file_failed(&self, file: &FileRecord, error: &str) -> EngineResult<()> {

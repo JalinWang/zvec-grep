@@ -67,6 +67,7 @@ async fn assert_incompatible_operations(
         let info = engine
             .info(InfoOptions {
                 root: Some(root.to_path_buf()),
+                index_dir: None,
                 include_status,
             })
             .await?;
@@ -112,7 +113,7 @@ async fn assert_incompatible_operations(
     assert_rebuild_error(&error);
     assert_manifest_unchanged(root, manifest)?;
     let error = engine
-        .watch_workspace(root, &TaskControl::default())
+        .watch_workspace(root, None, &TaskControl::default())
         .await
         .err()
         .expect("watch must reject incompatible data before starting");
@@ -192,6 +193,24 @@ async fn incompatible_versions_require_explicit_rebuild_across_public_operations
         assert!(old_storage.is_dir(), "rebuild keeps the fixed index path");
         assert!(!root.join(".zvec-grep/temp").exists());
     }
+    // Version 2 was never released: older development schemas must be rebuilt.
+    current
+        .as_object_mut()
+        .expect("manifest")
+        .remove("sourceRoot");
+    let incompatible = serde_json::to_vec(&current)?;
+    fs::write(root.join(".zvec-grep/manifest.json"), &incompatible)?;
+    assert_incompatible_operations(&engine, &options, Some(2), &incompatible).await?;
+    engine
+        .index(IndexOptions {
+            rebuild: true,
+            ..options.clone()
+        })
+        .await?;
+    assert_eq!(
+        assert_current_index(&engine, root).await?["sourceRoot"],
+        ".."
+    );
     engine.drop_index(info_options(root)).await?;
     engine.close();
     Ok(())
