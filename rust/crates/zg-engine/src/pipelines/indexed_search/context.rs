@@ -139,10 +139,11 @@ pub(crate) fn normalize_context_request(
 
 fn normalize_image_request(image: &QueryImage) -> Result<NormalizedContextRequest, EngineError> {
     let (image, display_query) = match image {
-        QueryImage::Path { path } => (
-            crate::extraction::read_image(path)?,
-            format!("image:{}", path.display()),
-        ),
+        QueryImage::Path { path } => {
+            let image = crate::extraction::read_image(path)?;
+            let path = crate::workspace::layout::canonical_path(path)?;
+            (image, format!("image:{}", path.display()))
+        }
         QueryImage::Bytes { format, data } => (
             crate::extraction::prepare_image(data.clone(), *format)?,
             format!("image:{}", format.as_str()),
@@ -1058,10 +1059,17 @@ mod tests {
         let path = directory.path().join("arbitrary.extension");
         std::fs::write(&path, &data).expect("write image");
         let from_path = normalize_context_request(&ContextOptions {
-            query_image: Some(QueryImage::Path { path }),
+            query_image: Some(QueryImage::Path { path: path.clone() }),
             ..Default::default()
         })
         .expect("detect image by bytes");
+        let canonical = std::fs::canonicalize(&path).expect("canonical image");
+        let from_canonical = normalize_context_request(&ContextOptions {
+            query_image: Some(QueryImage::Path { path: canonical }),
+            ..Default::default()
+        })
+        .expect("canonical image request");
+        assert_eq!(from_path.display_query, from_canonical.display_query);
         assert_eq!(from_path.image.expect("image").data(), data);
         for (format, data) in [(FileFormat::Jpeg, data), (FileFormat::Png, vec![1, 2, 3])] {
             assert!(

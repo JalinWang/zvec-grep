@@ -1,7 +1,9 @@
 //! Source file identities, snapshots, and indexing status.
 
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
 };
 use zvec_rust::{Collection, CollectionSchema, DataType, Doc, SearchQuery};
@@ -28,6 +30,8 @@ use ids::FileIds;
 pub(super) struct Files {
     collection: Collection,
     ids: Option<FileIds>,
+    dirty_path: PathBuf,
+    interrupted: RefCell<HashSet<FileId>>,
 }
 
 impl Files {
@@ -45,9 +49,12 @@ impl Files {
         let mut files = Self {
             collection: open_collection(&root.join("files"), &files_schema()?, read_only)?,
             ids,
+            dirty_path: root.join("pending-files"),
+            interrupted: RefCell::new(read_dirty(root)?),
         };
         if !read_only {
             let paths = files.list_paths()?;
+            files.recover_dirty()?;
             files
                 .ids
                 .as_mut()
@@ -65,6 +72,9 @@ impl Files {
         let mut files = iterator
             .map(|doc| decode_file_doc(&native(doc, "read source file")?))
             .collect::<EngineResult<Vec<_>>>()?;
+        for file in &mut files {
+            self.hide_interrupted(file);
+        }
         files.sort_by(|left, right| {
             left.relative_path
                 .cmp(&right.relative_path)
@@ -133,7 +143,8 @@ impl Files {
         fetch_map(&self.collection, &keys)?
             .into_values()
             .map(|doc| {
-                let file = decode_file_doc(&doc)?;
+                let mut file = decode_file_doc(&doc)?;
+                self.hide_interrupted(&mut file);
                 Ok((file.id, file))
             })
             .collect()
@@ -145,7 +156,9 @@ impl Files {
             &self.collection,
             &[encode_file_doc(file, directories)?],
             "write source file",
-        )
+        )?;
+        self.interrupted.borrow_mut().remove(&file.id);
+        Ok(())
     }
 
     /// Preserve every query projection while recording a resumable deletion.
@@ -172,10 +185,94 @@ impl Files {
                 .delete_by_filter(&format!("file_id = {}", id.get())),
             "delete source file",
         )?;
+        self.interrupted.borrow_mut().remove(&id);
         self.ids
             .as_mut()
             .expect("writable file identities")
             .remove(id);
+        Ok(())
+    }
+
+    // A durable intent precedes cross-table mutation. Until a checkpoint flushes
+    // every table, reopening must hide these files even if their commit record
+    // happened to reach disk before their projections.
+    pub(super) fn mark_dirty(&self, id: FileId) -> EngineResult<()> {
+        self.assert_writable()?;
+        if !self.dirty_path.exists() {
+            fs::create_dir_all(&self.dirty_path).map_err(|error| journal_error(&error))?;
+        }
+        // Also retry this barrier after an earlier directory-sync failure.
+        crate::utils::sync_directory(self.dirty_path.parent().expect("storage root"))?;
+        let marker = self.dirty_path.join(id.get().to_string());
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(file) => file.sync_all().map_err(|error| journal_error(&error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(journal_error(&error)),
+        }
+        crate::utils::sync_directory(&self.dirty_path)
+    }
+
+    pub(super) fn commit_dirty(&self) -> EngineResult<()> {
+        let entries = match fs::read_dir(&self.dirty_path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(journal_error(&error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| journal_error(&error))?;
+            let id = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .ok_or_else(|| corrupt("invalid unfinished file intent"))?;
+            if !self.interrupted.borrow().contains(&FileId::new(id)) {
+                fs::remove_file(entry.path()).map_err(|error| journal_error(&error))?;
+            }
+        }
+        if self.interrupted.borrow().is_empty() {
+            fs::remove_dir(&self.dirty_path).map_err(|error| journal_error(&error))?;
+            crate::utils::sync_directory(self.dirty_path.parent().expect("storage root"))
+        } else {
+            crate::utils::sync_directory(&self.dirty_path)
+        }
+    }
+
+    pub(super) fn interrupted_ids(&self) -> Vec<FileId> {
+        self.interrupted.borrow().iter().copied().collect()
+    }
+
+    fn hide_interrupted(&self, file: &mut FileRecord) {
+        if self.interrupted.borrow().contains(&file.id)
+            && !matches!(file.index_status, FileIndexStatus::Deleting)
+        {
+            file.index_status = FileIndexStatus::NotIndexed;
+        }
+    }
+
+    fn recover_dirty(&mut self) -> EngineResult<()> {
+        let keys = self
+            .interrupted
+            .borrow()
+            .iter()
+            .copied()
+            .map(file_key)
+            .collect::<Vec<_>>();
+        for mut doc in fetch_map(&self.collection, &keys)?.into_values() {
+            let mut file = decode_file_doc(&doc)?;
+            self.hide_interrupted(&mut file);
+            native(
+                doc.add_string("payload", &codec::encode_file(&file)?),
+                "recover unfinished file",
+            )?;
+            write_docs(&self.collection, &[doc], "recover unfinished file")?;
+        }
+        if !self.interrupted.borrow().is_empty() {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -192,6 +289,29 @@ impl Files {
     fn assert_writable(&self) -> EngineResult<()> {
         self.ids.as_ref().map(|_| ()).ok_or_else(read_only_error)
     }
+}
+
+fn journal_error(error: &std::io::Error) -> EngineError {
+    EngineError::from_io("persist unfinished file intent", error)
+}
+
+fn read_dirty(root: &Path) -> EngineResult<HashSet<FileId>> {
+    let entries = match fs::read_dir(root.join("pending-files")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(journal_error(&error)),
+    };
+    entries
+        .map(|entry| {
+            let entry = entry.map_err(|error| journal_error(&error))?;
+            let id = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+                .ok_or_else(|| corrupt("invalid unfinished file intent"))?;
+            Ok(FileId::new(id))
+        })
+        .collect()
 }
 
 fn read_only_error() -> EngineError {

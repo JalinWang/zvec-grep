@@ -436,12 +436,10 @@ impl IndexStore {
     pub(crate) fn delete_file(&self, file_id: FileId) -> EngineResult<()> {
         self.write(|state| {
             state.needs_optimize = true;
+            state.files.mark_dirty(file_id)?;
             state.files.mark_deleting(file_id)?;
-            state.files.flush()?;
             state.fragments.delete_file(file_id)?;
             state.entities.delete_file(file_id)?;
-            state.fragments.flush()?;
-            state.entities.flush()?;
             state.files.delete(file_id)
         })
     }
@@ -511,15 +509,12 @@ fn replace_file(
     let fragment_docs = Fragments::prepare(file, entities, entries, &directories)?;
     let mut unfinished = file.clone();
     unfinished.index_status = FileIndexStatus::NotIndexed;
+    state.files.mark_dirty(file.id)?;
     state.files.put(&unfinished, &directories)?;
-    state.files.flush()?;
     state.fragments.delete_file(file.id)?;
     state.entities.delete_file(file.id)?;
     state.entities.write(&entity_docs)?;
     state.fragments.write(&fragment_docs)?;
-    state.directories.flush()?;
-    state.entities.flush()?;
-    state.fragments.flush()?;
     state.files.put(file, &directories)
 }
 
@@ -535,7 +530,9 @@ fn visible_filter(
         .list()?
         .into_iter()
         .filter(|file| !matches!(file.index_status, FileIndexStatus::Indexed { .. }))
-        .map(|file| file.id.to_string())
+        .map(|file| file.id)
+        .chain(state.files.interrupted_ids())
+        .map(|id| id.to_string())
         .collect::<Vec<_>>();
     if unfinished.is_empty() {
         return Ok(requested);
@@ -608,7 +605,8 @@ fn flush(state: &StoreState) -> EngineResult<()> {
     state.directories.flush()?;
     state.entities.flush()?;
     state.fragments.flush()?;
-    state.files.flush()
+    state.files.flush()?;
+    state.files.commit_dirty()
 }
 
 fn assert_usable(state: &StoreState) -> EngineResult<()> {

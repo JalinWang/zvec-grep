@@ -459,3 +459,31 @@ test("public index-readiness failures are product errors", () => {
     false,
   );
 });
+
+test("content-kind status supports shared and distinct embedding models", () => {
+  const status = groupedReadyStatus.replace(
+    "  Embedding   local/potion-code-16m-v2\n              256 dimensions · cosine",
+    "  text        local/potion-code-16m-v2 (256 dimensions, cosine) · 4,269 entities · ready\n  code        local/potion-code-16m-v2 (256 dimensions, cosine) · 0 entities · empty\n  image       not enabled",
+  );
+  assert.deepEqual(
+    parseNativeStatus(status),
+    parseNativeStatus(groupedReadyStatus),
+  );
+  const mixed = status.replace(
+    "  image       not enabled",
+    "  image       local/vision (512 dimensions, cosine) · 1 entities · ready",
+  );
+  assert.equal(
+    parseNativeStatus(mixed).embedding,
+    "text=local/potion-code-16m-v2,code=local/potion-code-16m-v2,image=local/vision",
+  );
+  assert.throws(
+    () =>
+      parseNativeStatus(status.replace("256 dimensions", "broken dimensions")),
+    /invalid text embedding/,
+  );
+  assert.throws(
+    () => parseNativeStatus(status.replace("  image       not enabled", "")),
+    /omitted image embedding/,
+  );
+});

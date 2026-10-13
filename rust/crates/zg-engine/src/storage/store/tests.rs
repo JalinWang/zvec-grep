@@ -2046,3 +2046,71 @@ fn vector_scores_follow_relevance_for_cosine_dot_product_and_euclidean() {
         );
     }
 }
+
+#[test]
+fn long_build_checkpoints_without_losing_searchable_files() {
+    let home = tempfile::tempdir().expect("workspace");
+    let store = open(home.path(), false);
+    let count = 513;
+    for index in 0..count {
+        let (file, entry) = file_at(&store, &format!("source-{index}.txt"));
+        store
+            .replace_fixture_file(&file, &[entry])
+            .expect("write file");
+    }
+    store.close().expect("close build");
+    let reader = open(home.path(), true);
+    let hits = reader
+        .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], count, None)
+        .expect("search after checkpoint and reopen");
+    assert_eq!(hits.len(), count);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.file_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        count
+    );
+}
+
+#[test]
+fn durable_intent_hides_a_completed_record_until_replacement_is_retried() {
+    let home = tempfile::tempdir().expect("workspace");
+    let store = open(home.path(), false);
+    let (file, entry) = file_at(&store, "interrupted.txt");
+    store
+        .replace_fixture_file(&file, std::slice::from_ref(&entry))
+        .expect("write");
+    store.close().expect("checkpoint");
+    // Worst-case crash ordering: the completed file record reached disk but
+    // another collection did not. The durable intent must take precedence.
+    let journal = home.path().join("pending-files");
+    fs::create_dir_all(&journal).expect("journal");
+    fs::write(journal.join(file.id.to_string()), b"").expect("intent");
+    let reader = open(home.path(), true);
+    assert!(
+        reader
+            .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], 1, None)
+            .expect("read")
+            .is_empty()
+    );
+    reader.close().expect("close reader");
+    let writer = open(home.path(), false);
+    assert!(
+        writer
+            .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], 1, None)
+            .expect("recover")
+            .is_empty()
+    );
+    writer.replace_fixture_file(&file, &[entry]).expect("retry");
+    writer.close().expect("commit retry");
+    assert!(!journal.exists(), "checkpoint removes durable intents");
+    let reader = open(home.path(), true);
+    assert_eq!(
+        reader
+            .search_vector(ContentKind::Text, &[1.0, 0.0, 0.0], 1, None)
+            .expect("recovered search")
+            .len(),
+        1
+    );
+}
