@@ -197,7 +197,7 @@ async fn execute_plan(plan: CliPlan) -> Result<(), Box<dyn Error>> {
                 } else {
                     args.color.unwrap_or_default()
                 },
-                io::stdout().is_terminal(),
+                zg_cli::stdout_supports_ansi(),
             )?;
             Ok(())
         }
@@ -327,7 +327,7 @@ async fn execute_context(
             io::stdout().lock(),
             &result,
             output,
-            io::stdout().is_terminal(),
+            zg_cli::stdout_supports_ansi(),
         )?;
         if output.debug {
             eprintln!(
@@ -403,8 +403,11 @@ async fn ensure_query_index(
         lock_timeout_ms: request.lock_timeout_ms,
         ..IndexOptions::default()
     };
-    let progress =
-        zg_cli::IndexProgressDisplay::new(io::stderr(), io::stderr().is_terminal(), output.color);
+    let progress = zg_cli::IndexProgressDisplay::new(
+        io::stderr(),
+        zg_cli::stderr_supports_ansi(),
+        output.color,
+    );
     let reporter = progress.reporter();
     let result: Result<_, Box<dyn Error>> = if let Some(home) = &server_home {
         zg_daemon::index_with_progress(home, index_request, &reporter)
@@ -550,7 +553,7 @@ async fn execute_direct_context(
         io::stdout().lock(),
         &result,
         output,
-        io::stdout().is_terminal(),
+        zg_cli::stdout_supports_ansi(),
     )?;
     if output.debug {
         eprintln!(
@@ -579,7 +582,7 @@ async fn execute_index(
             let index_dir = request.index_dir.clone();
             let progress = zg_cli::IndexProgressDisplay::new(
                 io::stderr(),
-                io::stderr().is_terminal(),
+                zg_cli::stderr_supports_ansi(),
                 output.color,
             );
             let reporter = progress.reporter();
@@ -612,7 +615,7 @@ async fn execute_index(
                 &result,
                 info.workspace_index.as_ref().map(|index| &index.scan),
                 output,
-                io::stdout().is_terminal(),
+                zg_cli::stdout_supports_ansi(),
             )?;
             if output.debug {
                 eprintln!("Index diagnostics: {}", serde_json::to_string(&result)?);
@@ -734,7 +737,7 @@ async fn execute_status(
         io::stdout().lock(),
         &result,
         output,
-        io::stdout().is_terminal(),
+        zg_cli::stdout_supports_ansi(),
     )?;
     if output.debug {
         eprintln!("Status diagnostics: indexed={}", result.indexed);

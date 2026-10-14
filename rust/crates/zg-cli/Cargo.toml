@@ -18,6 +18,7 @@ zg-engine = { path = "../zg-engine" }
 
 [target.'cfg(windows)'.dependencies]
 dunce = "1.0.5"
+winapi-util = "0.1.11"
 
 [dev-dependencies]
 tempfile.workspace = true

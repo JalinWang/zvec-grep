@@ -4310,6 +4310,7 @@ dependencies = [
  "thiserror",
  "toml",
  "uuid",
+ "winapi-util",
  "zg-engine",
 ]
 

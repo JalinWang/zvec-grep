@@ -9,6 +9,7 @@ mod paths;
 mod progress;
 mod render;
 mod status;
+mod terminal;
 mod theme;
 pub use management::{
     write_authorization_revoke_result, write_authorization_status, write_index_drop_result,
@@ -17,6 +18,7 @@ pub use management::{
 pub use paths::output_path;
 pub use progress::IndexProgressDisplay;
 pub use status::{write_info_result, write_info_with_options};
+pub use terminal::{stderr_supports_ansi, stdout_supports_ansi};
 
 use std::{
     collections::BTreeMap,
