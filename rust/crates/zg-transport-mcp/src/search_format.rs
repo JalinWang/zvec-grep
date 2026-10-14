@@ -153,7 +153,7 @@ fn append_item(lines: &mut Vec<String>, item: &ContextItem, preview: SearchPrevi
             "#{}{selection} matchedBy={} {}",
             item.rank,
             matched_by_label(item.matched_by),
-            item.relative_path.display()
+            zg_cli::output_path(&item.relative_path).display()
         ));
         lines.push(format!(
             "type: image; format: {}; size: {} bytes",
@@ -170,7 +170,7 @@ fn append_item(lines: &mut Vec<String>, item: &ContextItem, preview: SearchPrevi
         "#{}{selection} matchedBy={} {}:{}",
         item.rank,
         matched_by_label(item.matched_by),
-        item.relative_path.display(),
+        zg_cli::output_path(&item.relative_path).display(),
         range_label(header_range)
     ));
     if item.kind == zg_engine::api::context::result::ContextItemKind::IndexedEntity {

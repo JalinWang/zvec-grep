@@ -4304,6 +4304,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dunce",
  "serde_json",
  "tempfile",
  "thiserror",

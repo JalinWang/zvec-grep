@@ -5,6 +5,7 @@ mod install;
 mod jsonc;
 mod managed_rg;
 mod management;
+mod paths;
 mod progress;
 mod render;
 mod status;
@@ -13,6 +14,7 @@ pub use management::{
     write_authorization_revoke_result, write_authorization_status, write_index_drop_result,
     write_index_result, write_index_with_options,
 };
+pub use paths::output_path;
 pub use progress::IndexProgressDisplay;
 pub use status::{write_info_result, write_info_with_options};
 

@@ -12,6 +12,8 @@ use zg_engine::api::context::{
     },
 };
 
+use crate::output_path;
+
 /// Writes a context reply in the stable CLI text layout.
 ///
 /// # Errors
@@ -28,7 +30,7 @@ pub fn write_context_result(mut writer: impl Write, result: &ContextResult) -> i
             if previous_path.is_some() {
                 writeln!(writer)?;
             }
-            writeln!(writer, "{}", item.relative_path.display())?;
+            writeln!(writer, "{}", output_path(&item.relative_path).display())?;
             previous_path = Some(item.relative_path.as_path());
         }
         if let ContentPreview::Image { format, size_bytes } = &item.preview {
@@ -62,6 +64,33 @@ pub fn write_context_with_options(
     use crate::ColorMode;
     use zg_engine::api::context::result::ContextSource;
     if options.json {
+        #[cfg(windows)]
+        let result = &{
+            let mut result = result.clone();
+            result.root = output_path(&result.root).to_path_buf();
+            if let Some(index) = &mut result.workspace_index {
+                index.path = output_path(&index.path).to_path_buf();
+            }
+            for item in result.items.iter_mut().chain(
+                result
+                    .group_results
+                    .iter_mut()
+                    .flat_map(|group| &mut group.items),
+            ) {
+                item.absolute_path = output_path(&item.absolute_path).to_path_buf();
+                item.relative_path = output_path(&item.relative_path).to_path_buf();
+            }
+            if let Some(rg) = &mut result.diagnostics.rg {
+                for path in std::iter::once(&mut rg.command)
+                    .chain(&mut rg.ignored_directories)
+                    .chain(&mut rg.missing_paths)
+                    .chain(&mut rg.searched_paths)
+                {
+                    *path = output_path(path).to_path_buf();
+                }
+            }
+            result
+        };
         serde_json::to_writer_pretty(&mut writer, result).map_err(io::Error::other)?;
         return writeln!(writer);
     }
@@ -151,7 +180,7 @@ fn write_indexed_items(
             format!(
                 "{}. {}{} [{}]",
                 item.rank,
-                item.relative_path.display(),
+                output_path(&item.relative_path).display(),
                 range,
                 item.preview.kind().as_str()
             )
@@ -160,7 +189,7 @@ fn write_indexed_items(
                 "#{} matchedBy={} {}{}",
                 item.rank,
                 matched_by.as_str().unwrap_or_default(),
-                item.relative_path.display(),
+                output_path(&item.relative_path).display(),
                 range
             )
         };
@@ -1161,6 +1190,80 @@ mod output_tests {
         assert!(!text.contains("picture.png:"));
         assert!(text.contains("image · Vector · independently ranked"));
         assert!(!text.contains("text · rule-ranked"));
+    }
+
+    #[test]
+    fn json_formats_path_fields_without_changing_queries_or_content() {
+        use zg_engine::api::context::result::{
+            ContextGroupResult, ContextQueryGroupRole, ContextWorkspaceIndex, RgDiagnostics,
+        };
+        let root = r"\\?\D:\workspace\repo";
+        let file = r"\\?\D:\workspace\repo\sample.rs";
+        let mut item = indexed_item();
+        item.absolute_path = file.into();
+        item.preview = ContentPreview::Text(file.into());
+        let result = ContextResult {
+            query: root.into(),
+            freshness: None,
+            background_refresh: None,
+            root: root.into(),
+            source: ContextSource::Index,
+            coverage: ContextCoverage::RankedSample,
+            workspace_index: Some(ContextWorkspaceIndex {
+                name: root.into(),
+                path: r"\\?\D:\workspace\repo\.zvec-grep".into(),
+            }),
+            items: vec![item.clone()],
+            group_results: vec![ContextGroupResult {
+                id: "primary".into(),
+                query: root.into(),
+                role: ContextQueryGroupRole::Primary,
+                items: vec![item],
+            }],
+            diagnostics: ContextDiagnostics {
+                rg: Some(RgDiagnostics {
+                    backend: "embedded".into(),
+                    command: r"\\?\D:\tools\zg.exe".into(),
+                    args: vec![root.into()],
+                    ignored_directories: vec![r"\\?\D:\workspace\repo\ignored".into()],
+                    missing_paths: vec![r"\\?\D:\workspace\repo\missing".into()],
+                    searched_paths: vec![root.into()],
+                    limit: None,
+                    truncated: false,
+                }),
+                ..ContextDiagnostics::default()
+            },
+        };
+        let original = result.clone();
+        let mut expected = serde_json::to_value(&result).expect("context");
+        if cfg!(windows) {
+            expected["root"] = r"D:\workspace\repo".into();
+            expected["workspace_index"]["path"] = r"D:\workspace\repo\.zvec-grep".into();
+            expected["items"][0]["absolute_path"] = r"D:\workspace\repo\sample.rs".into();
+            expected["group_results"][0]["items"][0]["absolute_path"] =
+                r"D:\workspace\repo\sample.rs".into();
+            expected["diagnostics"]["rg"]["command"] = r"D:\tools\zg.exe".into();
+            expected["diagnostics"]["rg"]["ignored_directories"][0] =
+                r"D:\workspace\repo\ignored".into();
+            expected["diagnostics"]["rg"]["missing_paths"][0] = r"D:\workspace\repo\missing".into();
+            expected["diagnostics"]["rg"]["searched_paths"][0] = r"D:\workspace\repo".into();
+        }
+        let mut bytes = Vec::new();
+        write_context_with_options(
+            &mut bytes,
+            &result,
+            OutputOptions {
+                json: true,
+                ..OutputOptions::default()
+            },
+            false,
+        )
+        .expect("JSON query output");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON"),
+            expected
+        );
+        assert_eq!(result, original);
     }
 
     #[test]

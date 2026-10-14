@@ -13,7 +13,7 @@ use zg_engine::{
 };
 
 use crate::{
-    ColorMode, OutputOptions,
+    ColorMode, OutputOptions, output_path,
     theme::{StatusTheme, display_path, format_count, storage_path, write_status_field},
 };
 
@@ -27,6 +27,23 @@ pub fn write_info_with_options(
     terminal: bool,
 ) -> io::Result<()> {
     if options.json {
+        #[cfg(windows)]
+        let result = &{
+            let mut result = result.clone();
+            result.root = output_path(&result.root).to_path_buf();
+            result.home = output_path(&result.home).to_path_buf();
+            result.index_path = output_path(&result.index_path).to_path_buf();
+            if let Some(index) = &mut result.workspace_index {
+                index.root = output_path(&index.root).to_path_buf();
+                index.path = output_path(&index.path).to_path_buf();
+            }
+            if let Some(status) = &mut result.status {
+                for file in &mut status.failed_files {
+                    file.path = output_path(&file.path).to_path_buf();
+                }
+            }
+            result
+        };
         serde_json::to_writer_pretty(&mut writer, result).map_err(io::Error::other)?;
         return writeln!(writer);
     }
@@ -313,7 +330,7 @@ fn write_diagnostics(
                 } else {
                     compact
                 };
-                format!("{}: {compact}", path.display())
+                format!("{}: {compact}", output_path(path).display())
             })
             .collect();
         if files.len() > 3 {
@@ -359,7 +376,7 @@ pub(crate) fn scan_filters(scan: &ScanRules) -> String {
             "ignore-file={}",
             scan.ignore_files()
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| output_path(path).display().to_string())
                 .collect::<Vec<_>>()
                 .join("|")
         ));
@@ -470,6 +487,54 @@ mod tests {
                 "✓ Workspace index is ready\n  /workspace\n\n  Coverage    {bar} 100%  1,132 / 1,132 files\n  Entities    22,037\n  Source size 4,177,103 bytes\n  Queue       0 pending · 0 failed\n\n  text        qwen/text-embedding-v4 (1,024 dimensions, cosine) · 22,037 entities · ready\n  code        not enabled\n  image       not enabled\n  FTS         text/code: tokenizer=jieba filters=lowercase\n\n  Storage     .zvec-grep/index\n  Version     2\n  Nested Git  included\n"
             )
         );
+    }
+
+    #[test]
+    fn json_formats_path_fields_without_changing_status_or_messages() {
+        let mut info = ready();
+        let root = r"\\?\D:\workspace\repo";
+        info.root = root.into();
+        info.home = r"\\?\D:\workspace\repo\.zvec-grep".into();
+        info.index_path = r"\\?\D:\workspace\repo\.zvec-grep\index".into();
+        let index = info.workspace_index.as_mut().expect("workspace");
+        index.root = info.root.clone();
+        index.path = info.home.clone();
+        info.status.as_mut().expect("status").failed_files = vec![FailedFile {
+            path: r"\\?\D:\workspace\repo\failed.txt".into(),
+            reason: root.into(),
+        }];
+        info.suggestion = Some(root.into());
+        let original = info.clone();
+        let mut expected = serde_json::to_value(&info).expect("status");
+        if cfg!(windows) {
+            expected["root"] = r"D:\workspace\repo".into();
+            expected["home"] = r"D:\workspace\repo\.zvec-grep".into();
+            expected["index_path"] = r"D:\workspace\repo\.zvec-grep\index".into();
+            expected["workspace_index"]["root"] = expected["root"].clone();
+            expected["workspace_index"]["path"] = expected["home"].clone();
+            expected["status"]["failed_files"][0]["path"] = r"D:\workspace\repo\failed.txt".into();
+        }
+        let mut bytes = Vec::new();
+        write_info_with_options(
+            &mut bytes,
+            &info,
+            OutputOptions {
+                json: true,
+                ..OutputOptions::default()
+            },
+            false,
+        )
+        .expect("JSON status output");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON"),
+            expected
+        );
+        assert_eq!(info, original);
+        assert!(render(&info, ColorMode::Never).contains(if cfg!(windows) {
+            "  D:\\workspace\\repo\n"
+        } else {
+            "  \\\\?\\D:\\workspace\\repo\n"
+        }));
     }
 
     #[test]
