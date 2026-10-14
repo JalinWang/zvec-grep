@@ -668,10 +668,8 @@ fn index_directory_cli_overrides_environment_and_default() {
         );
         let info: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON status");
         let canonical_root = fixture.root.path().canonicalize().expect("root");
-        assert_eq!(
-            info["home"],
-            json!(canonical_root.join(directory.file_name().expect("directory name")))
-        );
+        let expected_home = canonical_root.join(directory.file_name().expect("directory name"));
+        assert_eq!(info["home"], json!(zg_cli::output_path(&expected_home)));
         assert!(
             !directory.exists(),
             "read-only status must not create an index"
