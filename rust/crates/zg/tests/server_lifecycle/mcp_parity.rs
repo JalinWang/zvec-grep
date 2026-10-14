@@ -131,7 +131,10 @@ fn check_merged_cli_trace(
         .output()?;
     assert_command_success(&output);
     let text = String::from_utf8(output.stdout)?;
-    assert!(text.contains("text + code · rule-ranked"), "{text}");
+    assert!(text.contains("Context: Index"), "{text}");
+    assert!(text.contains("group: text kinds=text,code "), "{text}");
+    assert!(!text.contains("text + code · rule-ranked"), "{text}");
+    assert!(!text.contains("Group 1 · matches:"), "{text}");
     assert!(
         text.contains("scoring=rule recall=FullText merge=shared_recall_then_rules"),
         "{text}"

@@ -103,10 +103,11 @@ pub fn write_context_with_options(
             value
         }
     };
-    if options.human {
+    if options.trace {
         writeln!(writer, "{}: {:?}", heading("Context".into()), result.source)?;
+    }
+    if options.human {
         writeln!(writer, "Query: {}", result.query)?;
-        writeln!(writer, "Hits: {}", result.items.len())?;
     }
     write_index_diagnostics(&mut writer, result, options.trace)?;
     if result.source == ContextSource::Rg {
@@ -141,34 +142,45 @@ fn write_indexed_items(
         let message = empty_message(result);
         return writeln!(writer, "{message}");
     }
+    let groups: Vec<_> = result
+        .diagnostics
+        .index
+        .iter()
+        .flat_map(|diagnostics| &diagnostics.result_groups)
+        .filter(|group| group.item_count > 0)
+        .collect();
     for (index, item) in result.items.iter().enumerate() {
-        if let Some(group) = result.diagnostics.index.as_ref().and_then(|diagnostics| {
-            diagnostics
-                .result_groups
+        if index > 0 {
+            writeln!(writer)?;
+        }
+        if groups.len() > 1
+            && let Some((group_index, group)) = groups
                 .iter()
-                .find(|group| group.item_count > 0 && group.item_start == index)
-        }) {
+                .enumerate()
+                .find(|(_, group)| group.item_start == index)
+        {
+            let mut matched_kinds: Vec<_> = result
+                .items
+                .iter()
+                .skip(group.item_start)
+                .take(group.item_count)
+                .map(|item| item.preview.kind())
+                .collect();
+            matched_kinds.sort_unstable();
+            matched_kinds.dedup();
             writeln!(
                 writer,
                 "{}",
                 heading(format!(
-                    "{} · {} · independently ranked",
-                    group
-                        .kinds
+                    "Group {} · matches: {}",
+                    group_index + 1,
+                    matched_kinds
                         .iter()
                         .map(|kind| kind.as_str())
                         .collect::<Vec<_>>()
                         .join(" + "),
-                    if group.rule_ranking {
-                        "rule-ranked".to_owned()
-                    } else {
-                        format!("{:?}", group.scoring)
-                    }
                 ))
             )?;
-        }
-        if index > 0 {
-            writeln!(writer)?;
         }
         let range = if matches!(item.preview, ContentPreview::Image { .. }) {
             String::new()
@@ -194,7 +206,7 @@ fn write_indexed_items(
             )
         };
         writeln!(writer, "{}", heading(label))?;
-        if !matches!(item.preview, ContentPreview::Image { .. }) {
+        if !options.human && !matches!(item.preview, ContentPreview::Image { .. }) {
             writeln!(writer, "type: {}", item.preview.kind().as_str())?;
         }
         write_item_preview(&mut writer, item, options)?;
@@ -529,7 +541,7 @@ Result options:
   --json                            Emit complete structured results and groups
   --preview <none|short|full>       Indexed preview size (default: full on TTY, none in compact mode)
   --debug                           Print diagnostics to stderr
-  --trace                           Include per-hit indexed search trace
+  --trace                           Show search source, targets, grouping and per-hit trace
   --refresh <background|wait|off>   Refresh policy (defaults: server=background, direct=off)
                                     In direct mode, background warns and falls back to off
   --mode <direct|server|auto>       Select indexed query transport (default: auto)
@@ -1188,8 +1200,50 @@ mod output_tests {
         assert!(!text.contains("entity:"));
         assert!(!text.contains("generation:"));
         assert!(!text.contains("picture.png:"));
-        assert!(text.contains("image · Vector · independently ranked"));
-        assert!(!text.contains("text · rule-ranked"));
+        assert!(!text.contains("Group "));
+        assert!(!text.contains("ranked"));
+
+        result.items.insert(0, indexed_item());
+        let groups = &mut result
+            .diagnostics
+            .index
+            .as_mut()
+            .expect("index diagnostics")
+            .result_groups;
+        groups[0]
+            .kinds
+            .push(zg_engine::api::context::options::ContentKind::Code);
+        groups[0].item_count = 1;
+        groups[1].item_start = 1;
+        for human in [false, true] {
+            let mut output = Vec::new();
+            write_context_with_options(
+                &mut output,
+                &result,
+                OutputOptions {
+                    human,
+                    ..OutputOptions::default()
+                },
+                false,
+            )
+            .expect("render separate result groups");
+            let text = String::from_utf8(output).expect("UTF-8");
+            assert!(!text.contains("Results are ranked within each group."));
+            assert!(!text.contains("Hits:"));
+            assert!(text.contains("Group 1 · matches: text\n"));
+            assert!(text.contains("Group 2 · matches: image\n"));
+            assert!(!text.contains("text + code"));
+            assert!(!text.contains("rule-ranked"));
+            if human {
+                assert!(text.contains("1. sample.rs:1-20 [text]"));
+                assert!(text.contains("1. picture.png [image]"));
+                assert!(!text.contains("type: text"));
+            } else {
+                assert!(text.contains("#1 matchedBy=fts sample.rs:1-20"));
+                assert!(text.contains("#1 matchedBy=fts picture.png"));
+                assert!(text.contains("type: text"));
+            }
+        }
     }
 
     #[test]
@@ -1280,13 +1334,20 @@ mod output_tests {
             diagnostics: ContextDiagnostics::default(),
             items: vec![indexed_item()],
         };
-        let render = |preview, trace| {
+        result.diagnostics.index = Some(serde_json::from_value(serde_json::json!({
+            "input_kind":"text", "targets":[], "incomplete":false, "limit":30,
+            "hits_returned":1, "query_groups":[], "routes":[], "result_groups":[
+                {"id":"text", "kinds":["text","code"], "model_refs":["fixture/model"], "scoring":"full_text", "rule_ranking":true, "item_start":0, "item_count":1}
+            ]
+        })).expect("shared text/code group"));
+        let render = |preview, trace, human| {
             let mut buffer = Vec::new();
             write_context_with_options(
                 &mut buffer,
                 &result,
                 OutputOptions {
                     trace,
+                    human,
                     preview,
                     ..OutputOptions::default()
                 },
@@ -1295,16 +1356,26 @@ mod output_tests {
             .expect("render");
             String::from_utf8(buffer).expect("UTF-8")
         };
-        let minimal = render(PreviewMode::None, false);
+        let minimal = render(PreviewMode::None, false, false);
         assert!(minimal.contains("#1 matchedBy=fts sample.rs:1-20"));
         assert!(minimal.contains("1: line1"));
         assert!(!minimal.contains("2: line2"));
-        let short = render(PreviewMode::Short, false);
+        let short = render(PreviewMode::Short, false, false);
         assert!(short.contains("10: line10"));
         assert!(!short.contains("11: line11"));
-        let full = render(PreviewMode::Full, true);
+        let full = render(PreviewMode::Full, true, true);
         assert!(full.contains("20: line20"));
         assert!(full.contains("score: 0.7500"));
+        assert!(full.contains("Context: Index"));
+        assert!(full.contains("group: text kinds=text,code models=fixture/model scoring=rule"));
+        assert!(!minimal.contains("Context:"));
+        assert!(!minimal.contains("Group "));
+        assert!(!minimal.contains("rule-ranked"));
+        let human = render(PreviewMode::Full, false, true);
+        assert!(!human.contains("Context:"));
+        assert!(human.contains("Query: needle\n1. sample.rs:1-20 [text]"));
+        assert!(!human.contains("type: text"));
+        assert!(!human.contains("Group "));
 
         result.items[0].range = ContentRange::Text {
             start_line: 1,

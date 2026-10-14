@@ -215,7 +215,10 @@ does not force incompatible models into one relevance ranking. `--limit` is a
 total cap from 1 to 2000 (default 30), allocated round-robin across the resulting
 groups in text/code/image order. `--trace` explains targets, models, shared recall
 and rule ranking; `--json` preserves paths, previews, target outcomes and result
-groups. `--status --json` shows effective tables and per-kind entity counts.
+groups. Text output shows group headings only when multiple groups return hits;
+headings list the content kinds actually returned, and ranks apply within each
+group. Search scope and ranking details remain available with `--trace`.
+`--status --json` shows effective tables and per-kind entity counts.
 Images return their path, format and encoded size. Public content-snapshot reading
 is not exposed; internal entity snapshots remain part of the index.
 
